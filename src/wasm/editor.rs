@@ -1,0 +1,1163 @@
+//! WasmEditor — edit an existing PDF incrementally + WasmPdfWriter.
+
+use wasm_bindgen::prelude::*;
+
+use super::bbox_from_quad_points;
+
+// ---------------------------------------------------------------------------
+// WasmEditor — edit an existing PDF incrementally
+// ---------------------------------------------------------------------------
+
+/// An open PDF editor using the copy-on-write incremental update model.
+///
+/// Open with [`WasmEditor::open`], apply changes, then call [`WasmEditor::save`]
+/// to get the updated PDF bytes.  Each call to `save` updates the stored bytes
+/// so multiple rounds of editing and saving are supported.
+#[wasm_bindgen]
+pub struct WasmEditor {
+    pub(crate) editor: crate::editor::PdfEditor,
+    /// Original PDF bytes needed by `save_append` to produce the update section.
+    pub(crate) original_bytes: Vec<u8>,
+    /// Redact zones queued by `add_redact`; consumed by `apply_redactions`.
+    pending_redact_zones: Vec<crate::editor::RedactZone>,
+    /// Active edit sessions keyed by page index.  Populated by `enter_edit_mode`,
+    /// consumed (and written back) by `exit_edit_mode`.
+    edit_sessions: std::collections::HashMap<usize, crate::editor::EditSession>,
+    /// Word-style text-edit blocks for the page entered via `text_edit_enter`.
+    pub(crate) text_edit_blocks: Vec<crate::editor::EditBlock>,
+    /// Page index the current `text_edit_blocks` belong to.
+    pub(crate) text_edit_page: usize,
+    /// The block currently open for caret/selection editing (Phase 1).
+    pub(crate) active_text_edit: Option<super::text_edit::ActiveTextEdit>,
+    /// Full text model (blocks + parsed content streams) retained so
+    /// `text_edit_render_block` can re-render an edited block through the real
+    /// renderer. Only read under the `render` feature.
+    #[cfg_attr(not(feature = "render"), allow(dead_code))]
+    pub(crate) text_edit_model: Option<crate::editor::TextModel>,
+    /// Document reparsed from pending edits (writer pool applied), tagged with the
+    /// writer **generation** it reflects. `text_edit_enter` rebuilds the editable
+    /// model from this when edits are pending, so re-entering edit mode shows
+    /// committed text — not the pristine `editor.doc`, which would resurrect the
+    /// original. The generation key is correct across in-place `set_object`
+    /// replacements and undo/redo, unlike the old pool-length key.
+    pub(crate) edit_model_doc: Option<(u64, crate::parser::objects::PdfDocument)>,
+    /// Writer generation at which the current `text_edit_model` was built. Lets
+    /// `text_edit_enter` reuse the model when re-entering the same page with no
+    /// new edits (e.g. opening several blocks on one page), instead of rebuilding
+    /// the edit session + per-font metrics every time.
+    pub(crate) text_edit_model_generation: u64,
+    /// Uncompressed serialised content-stream bytes for each object ID written to
+    /// the writer pool by a text commit.  Keyed by the new stream object ID.
+    ///
+    /// Used to skip the flate-decompress step inside `render_page` and
+    /// `render_committed_block_tile`: after `set_overrides` clears the
+    /// `decoded_stream_cache` entry, we re-insert the raw bytes here so the
+    /// renderer never has to re-inflate the committed content stream.
+    pub(crate) committed_bytes: std::collections::HashMap<u32, Vec<u8>>,
+    /// Whether the trial watermark has already been applied to the writer pool.
+    /// The watermark is appended once; subsequent `save()` calls must NOT re-apply
+    /// it (doing so multiplied watermark streams across every page on every save,
+    /// bloating the file and bumping the generation on each commit).
+    pub(crate) watermarked: bool,
+    /// Underline/strikethrough rects queued by `commit_block_runs_impl` and drawn
+    /// in `flush_and_cache` AFTER `commit_edit_session` rewrites `/Contents` to a
+    /// single reference. Tuple: `(committed_block_id, rects_for_that_block)`.
+    /// The block id is used to update only the edited block's entry in the page-level
+    /// decoration rebuild while preserving all other blocks' decorations.
+    pub(crate) pending_decorations: Option<(usize, Vec<crate::editor::DecoRect>)>,
+    /// Committed per-char style runs, keyed by block id. Captured by
+    /// `commit_block_runs_impl` so `text_edit_open` can restore decoration state
+    /// (underline/strike) when a block is reopened **within the same session**
+    /// (before any FULL-REBUILD merges the decoration stream into the model).
+    /// Cleared on FULL-REBUILD (block ids renumber + deco is then in the model)
+    /// and on `text_edit_exit`.
+    pub(crate) committed_style_runs: std::collections::HashMap<usize, Vec<crate::editor::StyleRun>>,
+}
+
+#[wasm_bindgen]
+impl WasmEditor {
+    /// Open an existing PDF for editing.
+    pub fn open(bytes: &[u8]) -> Result<WasmEditor, JsError> {
+        log::info!("[pdf-core] WasmEditor::open — {} bytes", bytes.len());
+        let original_bytes = bytes.to_vec();
+        let editor = crate::editor::PdfEditor::open(bytes.to_vec()).map_err(|e| {
+            log::error!("[pdf-core] WasmEditor::open failed: {}", e);
+            JsError::new(&e.to_string())
+        })?;
+        log::info!("[pdf-core] WasmEditor::open — ok");
+        Ok(WasmEditor {
+            editor,
+            original_bytes,
+            pending_redact_zones: Vec::new(),
+            edit_sessions: std::collections::HashMap::new(),
+            text_edit_blocks: Vec::new(),
+            text_edit_page: 0,
+            active_text_edit: None,
+            text_edit_model: None,
+            edit_model_doc: None,
+            text_edit_model_generation: u64::MAX,
+            committed_bytes: std::collections::HashMap::new(),
+            watermarked: false,
+            pending_decorations: None,
+            committed_style_runs: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Open a password-protected PDF for editing.
+    ///
+    /// `password` is the UTF-8 user or owner password string.
+    /// Returns a JS error wrapping `PdfError::Encrypted` if the password is wrong.
+    #[cfg(feature = "crypto")]
+    pub fn open_with_password(bytes: &[u8], password: &str) -> Result<WasmEditor, JsError> {
+        log::info!(
+            "[pdf-core] WasmEditor::open_with_password — {} bytes",
+            bytes.len()
+        );
+        let original_bytes = bytes.to_vec();
+        let editor =
+            crate::editor::PdfEditor::open_with_password(bytes.to_vec(), password.as_bytes())
+                .map_err(|e| {
+                    log::error!("[pdf-core] WasmEditor::open_with_password failed: {}", e);
+                    JsError::new(&e.to_string())
+                })?;
+        log::info!("[pdf-core] WasmEditor::open_with_password — ok");
+        Ok(WasmEditor {
+            editor,
+            original_bytes,
+            pending_redact_zones: Vec::new(),
+            edit_sessions: std::collections::HashMap::new(),
+            text_edit_blocks: Vec::new(),
+            text_edit_page: 0,
+            active_text_edit: None,
+            text_edit_model: None,
+            edit_model_doc: None,
+            text_edit_model_generation: u64::MAX,
+            committed_bytes: std::collections::HashMap::new(),
+            watermarked: false,
+            pending_decorations: None,
+            committed_style_runs: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Returns the current page count.
+    pub fn page_count(&self) -> Result<usize, JsError> {
+        self.editor
+            .doc
+            .page_count()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Clone the editor's already-parsed document into a fresh [`super::document::WasmDocument`].
+    ///
+    /// Avoids a second `WasmDocument::parse` round-trip after `WasmEditor::open`:
+    /// cloning skips XRef parsing (the expensive phase) and only copies the raw
+    /// bytes + index structures, making it significantly faster than re-parsing.
+    ///
+    /// The returned document is independent — it does not share state with the
+    /// editor and is safe to use for read-only rendering while the editor continues
+    /// to accumulate edits.
+    pub fn borrow_doc(&self) -> super::document::WasmDocument {
+        super::document::WasmDocument {
+            doc: self.editor.doc.clone(),
+        }
+    }
+
+    /// Produce a [`super::document::WasmDocument`] that reflects every committed
+    /// edit without serialising or re-parsing the PDF.
+    ///
+    /// Clones the editor's base document, then installs the writer pool's CoW
+    /// objects as permanent overrides so `get_object` returns the committed
+    /// versions. [`PdfDocument::set_overrides`] also clears stale
+    /// `decoded_stream_cache` entries for those IDs, guaranteeing that
+    /// `decode_contents` reads the committed content stream on the next call.
+    ///
+    /// Cheaper than `save()` + `WasmDocument::parse()`: the clone copies raw
+    /// bytes and the XRef index but skips all XRef-chain traversal and object
+    /// parsing work.
+    pub fn make_committed_doc(&self) -> super::document::WasmDocument {
+        let doc = self.editor.doc.clone();
+        if !self.editor.writer.is_empty() {
+            let overrides: std::collections::HashMap<u32, crate::parser::objects::PdfObject> = self
+                .editor
+                .writer
+                .all_ids()
+                .into_iter()
+                .filter_map(|id| self.editor.writer.get_object(id).map(|o| (id, o.clone())))
+                .collect();
+            doc.set_overrides(overrides);
+        }
+        super::document::WasmDocument { doc }
+    }
+
+    /// Extract pages `start..end` (0-based, exclusive end) into a new PDF document.
+    ///
+    /// Returns the bytes of the new PDF. Requires a Pro license.
+    pub fn extract_pages(&self, start: usize, end: usize) -> Result<Vec<u8>, JsError> {
+        crate::editor::extract_pages(self.original_bytes.clone(), start..end)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Page operations ──────────────────────────────────────────────────────
+
+    /// Insert a blank page at `index` (0-based).
+    ///
+    /// Pass `index == page_count()` to append at the end.
+    pub fn add_blank_page(
+        &mut self,
+        index: usize,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<(), JsError> {
+        log::debug!(
+            "[pdf-core] add_blank_page index={} {}×{}",
+            index,
+            width_pt,
+            height_pt
+        );
+        crate::editor::add_blank_page(&mut self.editor, index, width_pt, height_pt)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Delete the page at `index` (0-based).
+    pub fn delete_page(&mut self, index: usize) -> Result<(), JsError> {
+        log::debug!("[pdf-core] delete_page index={}", index);
+        crate::editor::delete_page(&mut self.editor, index)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Move the page at `from_index` to `to_index` (both 0-based).
+    pub fn move_page(&mut self, from_index: usize, to_index: usize) -> Result<(), JsError> {
+        log::debug!("[pdf-core] move_page from={} to={}", from_index, to_index);
+        crate::editor::move_page(&mut self.editor, from_index, to_index)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Set the rotation of page `index` to `degrees` clockwise (must be multiple of 90).
+    pub fn rotate_page(&mut self, index: usize, degrees: i32) -> Result<(), JsError> {
+        log::debug!("[pdf-core] rotate_page index={} degrees={}", index, degrees);
+        crate::editor::rotate_page(&mut self.editor, index, degrees)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Set or replace the crop box on page `index`.
+    ///
+    /// `x1, y1, x2, y2` define the visible region in PDF user-space points.
+    pub fn set_crop_box(
+        &mut self,
+        index: usize,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> Result<(), JsError> {
+        crate::editor::set_crop_box(&mut self.editor, index, [x1, y1, x2, y2])
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Content drawing ──────────────────────────────────────────────────────
+
+    /// Draw a single line of text on a page.
+    ///
+    /// `font_name` must be one of the 14 standard PDF fonts.
+    /// `r`, `g`, `b` are fill color in 0.0–1.0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        text: &str,
+        font_name: &str,
+        font_size: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        let style = crate::editor::TextStyle::new(font_name, font_size, [r, g, b]);
+        crate::editor::draw_text(&mut self.editor, page_index, x, y, text, &style)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Draw a filled rectangle on a page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_filled_rect(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        let style = crate::editor::RectStyle::filled([r, g, b]);
+        crate::editor::draw_rect(&mut self.editor, page_index, x, y, width, height, &style)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Draw a stroked rectangle on a page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_stroked_rect(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        line_width: f64,
+    ) -> Result<(), JsError> {
+        let style = crate::editor::RectStyle::stroked([r, g, b], line_width);
+        crate::editor::draw_rect(&mut self.editor, page_index, x, y, width, height, &style)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Draw a straight line on a page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_line(
+        &mut self,
+        page_index: usize,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        line_width: f64,
+    ) -> Result<(), JsError> {
+        crate::editor::draw_line(
+            &mut self.editor,
+            page_index,
+            x1,
+            y1,
+            x2,
+            y2,
+            [r, g, b],
+            line_width,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Draw an ellipse on a page.
+    ///
+    /// `cx`, `cy` is the center; `rx`, `ry` are the radii.
+    /// `fill_r/g/b` is the fill color; pass negative to skip fill.
+    /// `stroke_r/g/b` is the stroke color; pass negative to skip stroke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_ellipse(
+        &mut self,
+        page_index: usize,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        fill_r: f64,
+        fill_g: f64,
+        fill_b: f64,
+        stroke_r: f64,
+        stroke_g: f64,
+        stroke_b: f64,
+        line_width: f64,
+    ) -> Result<(), JsError> {
+        let fill = if fill_r >= 0.0 {
+            Some([fill_r, fill_g, fill_b])
+        } else {
+            None
+        };
+        let stroke = if stroke_r >= 0.0 {
+            Some([stroke_r, stroke_g, stroke_b])
+        } else {
+            None
+        };
+        let style = crate::editor::RectStyle {
+            fill,
+            stroke,
+            line_width,
+        };
+        crate::editor::draw_ellipse(&mut self.editor, page_index, cx, cy, rx, ry, &style)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Place a JPEG image on a page.
+    ///
+    /// `x`, `y` is the bottom-left position; `display_w`, `display_h` is the
+    /// rendered size in points. `pixel_width`, `pixel_height` are the JPEG
+    /// dimensions in pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_jpeg(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        display_w: f64,
+        display_h: f64,
+        jpeg_data: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<(), JsError> {
+        crate::editor::place_jpeg(
+            &mut self.editor,
+            page_index,
+            x,
+            y,
+            display_w,
+            display_h,
+            jpeg_data,
+            pixel_width,
+            pixel_height,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Place a raw RGB image on a page.
+    ///
+    /// `pixels` is row-major RGB bytes (3 bytes per pixel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_rgb_image(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        display_w: f64,
+        display_h: f64,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), JsError> {
+        crate::editor::place_image(
+            &mut self.editor,
+            page_index,
+            x,
+            y,
+            display_w,
+            display_h,
+            pixels,
+            width,
+            height,
+            3,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Annotations ──────────────────────────────────────────────────────────
+
+    /// Add a text (sticky note) annotation to a page.
+    ///
+    /// `x`, `y`, `width`, `height` are in PDF user-space points.
+    pub fn add_text_annotation(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        contents: &str,
+    ) -> Result<(), JsError> {
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Text {
+                contents: contents.to_string(),
+                open: false,
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a styled free-text box annotation to a page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_box(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        text: &str,
+        font_name: &str,
+        font_size: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        align: u8,
+    ) -> Result<(), JsError> {
+        let da = format!("/{} {} Tf {} {} {} rg", font_name, font_size, r, g, b);
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::FreeText {
+                contents: text.to_string(),
+                default_appearance: da,
+                align: Some(align),
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a highlight annotation to a page.
+    ///
+    /// `quad_points` is a flat array of 8·n values describing n quadrilaterals.
+    pub fn add_highlight(
+        &mut self,
+        page_index: usize,
+        quad_points: &[f64],
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        if quad_points.len() < 8 {
+            return Err(JsError::new("quad_points must have at least 8 values"));
+        }
+        let bbox = bbox_from_quad_points(quad_points);
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Highlight {
+                color: [r, g, b],
+                quad_points: quad_points.to_vec(),
+            },
+            bbox,
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a strikeout annotation to a page.
+    pub fn add_strikeout(
+        &mut self,
+        page_index: usize,
+        quad_points: &[f64],
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        if quad_points.len() < 8 {
+            return Err(JsError::new("quad_points must have at least 8 values"));
+        }
+        let bbox = bbox_from_quad_points(quad_points);
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::StrikeOut {
+                color: [r, g, b],
+                quad_points: quad_points.to_vec(),
+            },
+            bbox,
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a link annotation to a page.
+    pub fn add_link(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        uri: &str,
+    ) -> Result<(), JsError> {
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Link {
+                uri: uri.to_string(),
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add an underline annotation to a page.
+    pub fn add_underline(
+        &mut self,
+        page_index: usize,
+        quad_points: &[f64],
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        if quad_points.len() < 8 {
+            return Err(JsError::new("quad_points must have at least 8 values"));
+        }
+        let bbox = bbox_from_quad_points(quad_points);
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Underline {
+                color: [r, g, b],
+                quad_points: quad_points.to_vec(),
+            },
+            bbox,
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Mark a rectangular area on a page for redaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_redact(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Redact {
+                overlay_color: [r, g, b],
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        self.pending_redact_zones.push(
+            crate::editor::RedactZone::new(page_index, [x, y, x + width, y + height])
+                .with_color([r, g, b]),
+        );
+        Ok(())
+    }
+
+    /// Permanently apply all pending redactions and rewrite the PDF.
+    pub fn apply_redactions(&mut self) -> Result<(), JsError> {
+        let zones = std::mem::take(&mut self.pending_redact_zones);
+        let new_bytes = crate::editor::apply_redactions(&mut self.editor, &zones)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        self.editor = crate::editor::PdfEditor::open(new_bytes.clone())
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        self.original_bytes = new_bytes;
+        Ok(())
+    }
+
+    /// Flatten all annotations on a single page into the content stream.
+    ///
+    /// After this call the page has no `/Annots` and annotation visuals are
+    /// part of the page content, visible in all viewers.
+    pub fn flatten_annotations(&mut self, page_index: usize) -> Result<(), JsError> {
+        crate::editor::flatten_annotations(&mut self.editor, page_index)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Flatten annotations on every page.
+    pub fn flatten_all_annotations(&mut self) -> Result<(), JsError> {
+        crate::editor::flatten_all_annotations(&mut self.editor)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a freehand ink annotation to a page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ink(
+        &mut self,
+        page_index: usize,
+        points: &[f64],
+        r: f64,
+        g: f64,
+        b: f64,
+        line_width: f64,
+    ) -> Result<(), JsError> {
+        if points.len() < 4 || !points.len().is_multiple_of(2) {
+            return Err(JsError::new(
+                "points must be an even-length array with at least 4 values",
+            ));
+        }
+        let stroke: Vec<[f64; 2]> = points.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+        let xs: Vec<f64> = stroke.iter().map(|p| p[0]).collect();
+        let ys: Vec<f64> = stroke.iter().map(|p| p[1]).collect();
+        let pad = line_width / 2.0;
+        let bbox = [
+            xs.iter().cloned().fold(f64::MAX, f64::min) - pad,
+            ys.iter().cloned().fold(f64::MAX, f64::min) - pad,
+            xs.iter().cloned().fold(f64::MIN, f64::max) + pad,
+            ys.iter().cloned().fold(f64::MIN, f64::max) + pad,
+        ];
+        let mut builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Ink {
+                ink_list: vec![stroke],
+            },
+            bbox,
+        );
+        builder = builder.subject(&format!("w={} r={} g={} b={}", line_width, r, g, b));
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── In-place text editing ────────────────────────────────────────────────
+
+    /// Replace a text span in a page's content stream in-place.
+    ///
+    /// `x`, `y`, `font_size` identify the span (from `extract_text_spans`).
+    /// `old_text` is the original text to find; `new_text` is the replacement.
+    /// Returns `true` if a replacement was made, `false` if no match found
+    /// (e.g. scanned/image PDF with no extractable text).
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_text_in_stream(
+        &mut self,
+        page_index: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        font_size: f64,
+        old_text: &str,
+        new_text: &str,
+    ) -> Result<bool, JsError> {
+        let target = crate::editor::TextEditTarget {
+            x,
+            y,
+            width,
+            font_size,
+            old_text: old_text.to_owned(),
+        };
+        crate::editor::replace_text_in_page(&mut self.editor, page_index, &target, new_text)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Edit session (ONLYOFFICE-style enter / commit / exit) ────────────────
+
+    /// Enter edit mode for a page: parse the content stream into indexed text
+    /// frames and store the session internally.
+    ///
+    /// Returns a JSON array of frame objects:
+    /// `[{id, text, x, y, font_size, font_name, resource_key}, ...]`
+    ///
+    /// `x`/`y` are CTM-corrected PDF user-space coordinates (origin
+    /// bottom-left).  Returns `"[]"` for scanned/image-only pages.
+    pub fn enter_edit_mode(&mut self, page_index: usize) -> Result<String, JsError> {
+        log::debug!("[pdf-core] enter_edit_mode page={}", page_index);
+        let session = crate::editor::build_edit_session(&self.editor.doc, page_index)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let json = frames_to_json(&self.editor.doc, page_index, &session.frames);
+        self.edit_sessions.insert(page_index, session);
+        Ok(json)
+    }
+
+    /// Patch one text frame in the active edit session for `page_index`.
+    ///
+    /// `frame_id` is the `id` field from a frame returned by `enter_edit_mode`.
+    /// Returns `true` if the frame was found and patched; `false` if the session
+    /// does not exist or `frame_id` is out of range.
+    pub fn commit_text_edit(&mut self, page_index: usize, frame_id: usize, new_text: &str) -> bool {
+        log::debug!(
+            "[pdf-core] commit_text_edit page={} frame={} text={:?}",
+            page_index,
+            frame_id,
+            new_text
+        );
+        match self.edit_sessions.get_mut(&page_index) {
+            Some(session) => crate::editor::patch_frame(session, frame_id, new_text),
+            None => false,
+        }
+    }
+
+    /// Exit edit mode: serialize all patched ops back to the page content
+    /// stream and clear the session.
+    ///
+    /// Call `save()` afterwards to get the updated PDF bytes.
+    ///
+    /// Returns `true` if a modified session was actually written back to the
+    /// page (so the host knows it must re-render), `false` if nothing changed.
+    pub fn exit_edit_mode(&mut self, page_index: usize) -> Result<bool, JsError> {
+        log::debug!("[pdf-core] exit_edit_mode page={}", page_index);
+        if let Some(session) = self.edit_sessions.remove(&page_index) {
+            // Only write back a session that was actually patched via
+            // `commit_text_edit`. An unmodified session was built only to feed
+            // overlay frame metadata; re-serializing its pristine ops would
+            // overwrite the page and clobber any surgical `text_edit_commit`.
+            if session.dirty {
+                crate::editor::commit_edit_session(&mut self.editor, page_index, &session)
+                    .map_err(|e| JsError::new(&e.to_string()))?;
+                return Ok(true);
+            }
+            log::debug!(
+                "[pdf-core] exit_edit_mode page={} — session unmodified, skipping write-back",
+                page_index
+            );
+        }
+        Ok(false)
+    }
+
+    // ── Metadata ─────────────────────────────────────────────────────────────
+
+    /// Update document metadata.
+    ///
+    /// Pass an empty string to leave a field unchanged.
+    pub fn set_metadata(
+        &mut self,
+        title: &str,
+        author: &str,
+        subject: &str,
+        keywords: &str,
+    ) -> Result<(), JsError> {
+        let fields = crate::editor::MetadataFields {
+            title: if title.is_empty() { None } else { Some(title) },
+            author: if author.is_empty() {
+                None
+            } else {
+                Some(author)
+            },
+            subject: if subject.is_empty() {
+                None
+            } else {
+                Some(subject)
+            },
+            keywords: if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords)
+            },
+            creator: None,
+            producer: None,
+            mod_date: "",
+        };
+        crate::editor::set_metadata(&mut self.editor, &fields)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Undo / Redo ────────────────────────────────────────────────────────
+
+    /// Undo the most recent committed edit. Returns `true` if a change was
+    /// reverted, `false` if there was nothing to undo.
+    ///
+    /// Any open caret session and the cached text-edit model are discarded so
+    /// a following `text_edit_enter` rebuilds against the restored state (the
+    /// writer generation advanced, so the rebuild is forced regardless).
+    pub fn undo(&mut self) -> bool {
+        let did = self.editor.undo();
+        if did {
+            self.invalidate_edit_caches();
+        }
+        did
+    }
+
+    /// Redo the most recently undone edit. Returns `true` if a change was
+    /// re-applied, `false` if there was nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        let did = self.editor.redo();
+        if did {
+            self.invalidate_edit_caches();
+        }
+        did
+    }
+
+    /// Whether a subsequent `undo` would do anything.
+    pub fn can_undo(&self) -> bool {
+        self.editor.can_undo()
+    }
+
+    /// Whether a subsequent `redo` would do anything.
+    pub fn can_redo(&self) -> bool {
+        self.editor.can_redo()
+    }
+
+    /// Whether this PDF carries a digital signature (AcroForm `/SigFlags`).
+    ///
+    /// Editing and saving will invalidate the signature, so the host should
+    /// warn the user (or block editing) when this returns `true`.
+    pub fn is_signed(&self) -> bool {
+        self.editor.doc.is_signed()
+    }
+
+    /// Drop derived edit caches after an undo/redo so they rebuild from the
+    /// restored writer state on next use.
+    fn invalidate_edit_caches(&mut self) {
+        self.active_text_edit = None;
+        self.text_edit_model = None;
+        self.edit_model_doc = None;
+        self.committed_bytes.clear();
+        self.text_edit_model_generation = u64::MAX;
+    }
+
+    // ── Form filling ─────────────────────────────────────────────────────────
+
+    /// Return all interactive form fields as a JSON array.
+    ///
+    /// Each element contains: `id`, `name`, `full_name`, `field_type`, `value`,
+    /// `checked`, `readonly`, `required`, `rect` (array), and `options` (array).
+    /// Returns `"[]"` when the document has no `/AcroForm`.
+    pub fn get_form_fields(&self) -> Result<String, JsError> {
+        let fields = crate::forms::read_form_fields(&self.editor.doc)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let mut json = String::from("[");
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            let opts = f
+                .options
+                .iter()
+                .map(|o| super::json_str(o))
+                .collect::<Vec<_>>()
+                .join(",");
+            json.push_str(&format!(
+                r#"{{"id":{},"name":{},"full_name":{},"field_type":{},"value":{},"checked":{},"readonly":{},"required":{},"rect":[{},{},{},{}],"options":[{}]}}"#,
+                f.id,
+                super::json_str(&f.name),
+                super::json_str(&f.full_name),
+                super::json_str(&format!("{:?}", f.field_type)),
+                super::json_str(&f.value),
+                f.checked,
+                f.readonly,
+                f.required,
+                f.rect[0], f.rect[1], f.rect[2], f.rect[3],
+                opts,
+            ));
+        }
+        json.push(']');
+        Ok(json)
+    }
+
+    /// Set the value of a form field by name (full or partial).
+    ///
+    /// For text fields, `value` is the new string.
+    /// For checkboxes, `value` should be `"true"`, `"Yes"` (checked) or anything else (unchecked).
+    /// For combo/list fields, `value` is the export value to select.
+    pub fn set_field_value(&mut self, field_name: &str, value: &str) -> Result<(), JsError> {
+        let fields = crate::forms::read_form_fields(&self.editor.doc)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let field = fields
+            .iter()
+            .find(|f| f.full_name == field_name || f.name == field_name)
+            .ok_or_else(|| JsError::new(&format!("field '{}' not found", field_name)))?
+            .clone();
+        match field.field_type {
+            crate::forms::FieldType::Text => {
+                crate::forms::set_text_field(&mut self.editor, &field, value)
+            }
+            crate::forms::FieldType::Checkbox => {
+                let checked = value == "true" || value == "Yes";
+                crate::forms::set_checkbox(&mut self.editor, &field, checked)
+            }
+            crate::forms::FieldType::List | crate::forms::FieldType::Combo => {
+                crate::forms::set_combo_or_list(&mut self.editor, &field, value)
+            }
+            _ => Err(crate::error::PdfError::invalid_structure(
+                "set_field_value: unsupported field type",
+            )),
+        }
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Get the current value of a form field by name (full or partial).
+    pub fn get_field_value(&self, field_name: &str) -> Result<String, JsError> {
+        let fields = crate::forms::read_form_fields(&self.editor.doc)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        fields
+            .iter()
+            .find(|f| f.full_name == field_name || f.name == field_name)
+            .map(|f| f.value.clone())
+            .ok_or_else(|| JsError::new(&format!("field '{}' not found", field_name)))
+    }
+
+    // ── Save ─────────────────────────────────────────────────────────────────
+
+    /// Serialise the edited document as PDF bytes (incremental update).
+    ///
+    /// If no Pro/Enterprise license is active a trial watermark is burned onto
+    /// every page before serialisation. Subsequent calls to `save` or edit
+    /// methods work on the new bytes.
+    pub fn save(&mut self) -> Result<js_sys::Uint8Array, JsError> {
+        log::debug!("[pdf-core] WasmEditor::save — serialising incremental update");
+        // Diagnostic: if a text-edit session has dirty (patched-but-not-flushed)
+        // streams, those edits live only in the in-memory model — `save_append`
+        // serialises the WRITER POOL, which does NOT contain them yet. So this save
+        // will NOT include the pending edit unless `text_edit_exit` flushed first.
+        if let Some(model) = &self.text_edit_model {
+            if model.session.dirty {
+                log::warn!(
+                    "[save] ⚠ text_edit_model is DIRTY but NOT flushed — pending edits on page {} will be LOST from this save (call text_edit_exit before save). streams={}",
+                    self.text_edit_page,
+                    model.session.streams.len()
+                );
+            } else {
+                log::warn!("[save] text_edit_model present, not dirty — nothing pending");
+            }
+        } else {
+            log::warn!("[save] no text_edit_model — pure pool save");
+        }
+        // Apply the trial watermark ONCE. It then lives in the writer pool (and is
+        // baked into the collapsed main content stream on the next text flush), so
+        // re-applying on every save would multiply watermark streams across every
+        // page (file bloat) and bump the generation on each commit (forcing a
+        // FULL-REBUILD that renumbers blocks and desyncs the host's selection).
+        if !self.watermarked && crate::license::current_tier() == crate::license::Tier::Free {
+            crate::license::watermark::apply_trial_watermark(&mut self.editor)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            self.watermarked = true;
+        }
+        let new_bytes = self.editor.save_append(&self.original_bytes).map_err(|e| {
+            log::error!("[pdf-core] WasmEditor::save failed: {}", e);
+            JsError::new(&e.to_string())
+        })?;
+        log::info!(
+            "[pdf-core] WasmEditor::save — {} bytes written",
+            new_bytes.len()
+        );
+        self.original_bytes = new_bytes.clone();
+        Ok(js_sys::Uint8Array::from(new_bytes.as_slice()))
+    }
+
+    /// Render `page_index` from the editor's CURRENT (edited) state **without** a
+    /// byte reparse: overlay the writer-pool objects (the surgical commit's new
+    /// page dict + content stream) on the pristine parsed doc, render, then remove
+    /// the overlay. Lets the host paint a just-committed page immediately, skipping
+    /// the whole-document `WasmDocument::parse` round-trip. `scale` is device px per
+    /// PDF point.
+    #[cfg(feature = "render")]
+    pub fn render_page(
+        &self,
+        page_index: usize,
+        scale: f64,
+    ) -> Result<super::document::RenderResult, JsError> {
+        let overrides: std::collections::HashMap<u32, crate::parser::objects::PdfObject> = self
+            .editor
+            .writer
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| self.editor.writer.get_object(id).map(|o| (id, o.clone())))
+            .collect();
+        self.editor.doc.set_overrides(overrides);
+        // Re-insert uncompressed bytes for committed streams so render_page_rgba
+        // can skip the flate-decompress step (set_overrides just cleared these).
+        for (id, bytes) in &self.committed_bytes {
+            self.editor.doc.preload_stream(*id, bytes);
+        }
+        let rendered = crate::render::render_page_rgba(&self.editor.doc, page_index, scale);
+        self.editor.doc.clear_overrides();
+        let (w, h, data) = rendered.map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(super::document::RenderResult::new(w, h, data))
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn frames_to_json(
+    doc: &crate::parser::objects::PdfDocument,
+    page_index: usize,
+    frames: &[crate::editor::EditableFrame],
+) -> String {
+    use super::json_str;
+    use std::collections::HashMap;
+
+    // Cache metrics per (resource_key, font_size) so each distinct font+size is
+    // resolved once; `width` is the real advance width so the overlay never has
+    // to fall back to an undefined field (which produced NaN rects).
+    let mut cache: HashMap<(String, u64), Option<crate::editor::PdfFontMetrics>> = HashMap::new();
+    let parts: Vec<String> = frames
+        .iter()
+        .map(|f| {
+            let key = (f.resource_key.clone(), f64::to_bits(f.font_size));
+            let metrics = cache.entry(key).or_insert_with(|| {
+                crate::editor::font_metrics_for(doc, page_index, &f.resource_key, f.font_size)
+                    .ok()
+                    .flatten()
+            });
+            let width = match metrics.as_ref() {
+                Some(m) => crate::editor::text_width(m, &f.text),
+                // Proportional estimate when the font can't be resolved (CID, etc.).
+                None => f.text.chars().count() as f64 * 0.5 * f.font_size,
+            };
+            format!(
+                r#"{{"id":{},"text":{},"x":{},"y":{},"width":{},"font_size":{},"font_name":{},"resource_key":{}}}"#,
+                f.id,
+                json_str(&f.text),
+                f.x,
+                f.y,
+                width,
+                f.font_size,
+                json_str(&f.font_name),
+                json_str(&f.resource_key),
+            )
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+// ---------------------------------------------------------------------------
+// WasmPdfWriter — create a new PDF from scratch
+// ---------------------------------------------------------------------------
+
+/// Builder for creating a new PDF document.
+///
+/// Internally starts from a minimal blank template and adds pages on top.
+/// Call [`WasmPdfWriter::build`] to serialise the result.
+#[wasm_bindgen]
+pub struct WasmPdfWriter {
+    editor: crate::editor::PdfEditor,
+    current_bytes: Vec<u8>,
+    cleared: bool,
+}
+
+const BLANK_PDF: &[u8] = include_bytes!("../../tests/fixtures/minimal.pdf");
+
+#[wasm_bindgen]
+impl WasmPdfWriter {
+    /// Create a new empty PDF document.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<WasmPdfWriter, JsError> {
+        let bytes = BLANK_PDF.to_vec();
+        let editor = crate::editor::PdfEditor::open(bytes.clone())
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(WasmPdfWriter {
+            editor,
+            current_bytes: bytes,
+            cleared: false,
+        })
+    }
+
+    /// Append a blank page of the given size (in PDF points, 1 pt = 1/72 inch).
+    pub fn add_page(&mut self, width_pt: f64, height_pt: f64) -> Result<(), JsError> {
+        if !self.cleared {
+            crate::editor::delete_page(&mut self.editor, 0)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            self.cleared = true;
+        }
+        let n = self
+            .editor
+            .doc
+            .page_count()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        crate::editor::add_blank_page(&mut self.editor, n, width_pt, height_pt)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Serialise the document to PDF bytes.
+    pub fn build(&mut self) -> Result<js_sys::Uint8Array, JsError> {
+        let bytes = self
+            .editor
+            .save_append(&self.current_bytes)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        self.current_bytes = bytes.clone();
+        Ok(js_sys::Uint8Array::from(bytes.as_slice()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native-accessible byte-returning variants (for Rust tests and non-JS use)
+// ---------------------------------------------------------------------------
+
+impl WasmEditor {
+    /// Like [`save`](WasmEditor::save) but returns raw `Vec<u8>` bytes.
+    pub fn save_bytes(&mut self) -> crate::error::Result<Vec<u8>> {
+        let bytes = self.editor.save_append(&self.original_bytes)?;
+        self.original_bytes = bytes.clone();
+        Ok(bytes)
+    }
+}
+
+impl WasmPdfWriter {
+    /// Like [`build`](WasmPdfWriter::build) but returns raw `Vec<u8>` bytes.
+    pub fn build_bytes(&mut self) -> crate::error::Result<Vec<u8>> {
+        let bytes = self.editor.save_append(&self.current_bytes)?;
+        self.current_bytes = bytes.clone();
+        Ok(bytes)
+    }
+}

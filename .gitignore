@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+
+# Claude Code internal state
+.claude/
+
+# Planning/strategy documents
+.context/
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache (tests/gen_fixtures.py)
+__pycache__/
+*.pyc
+test_output/

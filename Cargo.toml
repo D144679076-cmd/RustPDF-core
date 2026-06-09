@@ -1,0 +1,68 @@
+[package]
+name = "pdf-core"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-based PDF processing core library targeting WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nom = "7"
+thiserror = "1"
+flate2 = "1.0"
+weezl = "0.1"
+log = "0.4"
+# Insertion-order-preserving map for PDF dictionaries (ISO 32000-1 §7.3.7):
+# keeps /Filter↔/DecodeParms pairing and signed-dict byte order stable.
+# Pure-Rust, WASM-compatible, O(1) lookups like HashMap.
+indexmap = "2"
+# Cross-platform RwLock (real lock on native, single-threaded shim on WASM) so
+# PdfDocument's caches are Sync without a cfg split — enables parallel render.
+parking_lot = "0.12"
+md-5 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true }
+hmac = { version = "0.12", optional = true }
+base64 = { version = "0.21", optional = true }
+# Random IV source for AES-CBC encryption on write. The `js` feature routes to
+# `crypto.getRandomValues` on wasm32; native targets use the OS RNG.
+getrandom = { version = "0.2", features = ["js"], optional = true }
+tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std"] }
+fontdue = { version = "0.9", optional = true }
+zune-jpeg = { version = "0.4", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+console_log = { version = "1", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+crypto = ["dep:md-5", "dep:sha2", "dep:aes", "dep:cbc", "dep:hmac", "dep:base64", "dep:getrandom"]
+render = ["dep:tiny-skia", "dep:fontdue", "dep:zune-jpeg"]
+writer = []
+forms  = ["writer"]
+# WASM bridge: exposes #[wasm_bindgen] types for JS integration.
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto"]
+# WASM bridge with page rendering included (adds ~800 KB to the WASM binary).
+wasm-render = ["wasm", "render"]
+# Viewer-only WASM build: parse, render, text extract. No editor, writer, forms, or crypto.
+wasm-viewer = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "render"]
+
+[[bin]]
+name = "pdf-inspect"
+path = "src/bin/pdf_inspect.rs"
+
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+required-features = ["crypto"]
+
+[dev-dependencies]
+pretty_assertions = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "render_bench"
+harness = false
+required-features = ["render"]
