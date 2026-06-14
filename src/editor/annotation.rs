@@ -58,6 +58,49 @@ pub enum AnnotationType {
         /// Default black `[0.0, 0.0, 0.0]`.
         overlay_color: [f64; 3],
     },
+    /// Stamp annotation — imprints a named label (e.g. "Approved", "Draft") on the page.
+    Stamp {
+        /// Predefined or custom stamp label.
+        name: String,
+        /// RGB ink color [0.0–1.0].
+        color: [f64; 3],
+    },
+    /// Polygon annotation — a closed (or explicitly open) polygon overlay.
+    Polygon {
+        /// Vertex coordinates as `[x, y]` pairs in page space.
+        vertices: Vec<[f64; 2]>,
+        /// When `false` the polygon is rendered open (same visual as Polyline with close).
+        closed: bool,
+        stroke_color: [f64; 3],
+        fill_color: Option<[f64; 3]>,
+        line_width: f64,
+    },
+    /// Polyline annotation — an open multi-segment line overlay.
+    Polyline {
+        /// Vertex coordinates as `[x, y]` pairs in page space.
+        vertices: Vec<[f64; 2]>,
+        stroke_color: [f64; 3],
+        line_width: f64,
+    },
+    /// FileAttachment annotation — embeds a file in the PDF at a page location.
+    ///
+    /// The raw `file_data` and `filename` are written as an EmbeddedFile stream
+    /// by `add_annotation`; callers should not set `prebuilt_ref` directly.
+    FileAttachment {
+        /// Raw bytes of the file to embed.
+        file_data: Vec<u8>,
+        /// Filename shown in the attachment panel.
+        filename: String,
+        /// Annotation tooltip / contents string.
+        description: String,
+        /// Icon name: "PushPin", "Graph", "Paperclip", or "Tag".
+        icon_name: String,
+    },
+    /// Caret annotation — marks a text insertion point.
+    Caret {
+        /// Symbol: "None" or "P" (paragraph mark).
+        symbol: String,
+    },
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -68,6 +111,9 @@ pub struct AnnotationBuilder {
     rect: [f64; 4],
     author: Option<String>,
     subject: Option<String>,
+    /// Pre-built indirect object ID used by `FileAttachment` to reference the
+    /// embedded-file Filespec object created in `add_annotation`.
+    prebuilt_ref: Option<u32>,
 }
 
 impl AnnotationBuilder {
@@ -78,6 +124,7 @@ impl AnnotationBuilder {
             rect,
             author: None,
             subject: None,
+            prebuilt_ref: None,
         }
     }
 
@@ -198,6 +245,74 @@ impl AnnotationBuilder {
                     PdfObject::Array(overlay_color.iter().map(|&v| PdfObject::Real(v)).collect()),
                 );
             }
+            AnnotationType::Stamp { name, color } => {
+                d.insert("Subtype".to_owned(), PdfObject::Name("Stamp".to_owned()));
+                d.insert("Name".to_owned(), PdfObject::Name(name));
+                insert_color(&mut d, &color);
+            }
+            AnnotationType::Polygon {
+                vertices,
+                closed: _,
+                stroke_color,
+                fill_color,
+                line_width,
+            } => {
+                d.insert("Subtype".to_owned(), PdfObject::Name("Polygon".to_owned()));
+                d.insert(
+                    "Vertices".to_owned(),
+                    PdfObject::Array(
+                        vertices
+                            .iter()
+                            .flat_map(|v| [PdfObject::Real(v[0]), PdfObject::Real(v[1])])
+                            .collect(),
+                    ),
+                );
+                insert_color(&mut d, &stroke_color);
+                if let Some(ic) = fill_color {
+                    d.insert("IC".to_owned(), color_array(&ic));
+                }
+                d.insert("BS".to_owned(), border_style_dict(line_width));
+            }
+            AnnotationType::Polyline {
+                vertices,
+                stroke_color,
+                line_width,
+            } => {
+                d.insert("Subtype".to_owned(), PdfObject::Name("PolyLine".to_owned()));
+                d.insert(
+                    "Vertices".to_owned(),
+                    PdfObject::Array(
+                        vertices
+                            .iter()
+                            .flat_map(|v| [PdfObject::Real(v[0]), PdfObject::Real(v[1])])
+                            .collect(),
+                    ),
+                );
+                insert_color(&mut d, &stroke_color);
+                d.insert("BS".to_owned(), border_style_dict(line_width));
+            }
+            AnnotationType::FileAttachment {
+                description,
+                icon_name,
+                ..
+            } => {
+                d.insert(
+                    "Subtype".to_owned(),
+                    PdfObject::Name("FileAttachment".to_owned()),
+                );
+                if let Some(fs_id) = self.prebuilt_ref {
+                    d.insert("FS".to_owned(), PdfObject::Reference(fs_id, 0));
+                }
+                d.insert("Name".to_owned(), PdfObject::Name(icon_name));
+                d.insert(
+                    "Contents".to_owned(),
+                    PdfObject::String(description.into_bytes()),
+                );
+            }
+            AnnotationType::Caret { symbol } => {
+                d.insert("Subtype".to_owned(), PdfObject::Name("Caret".to_owned()));
+                d.insert("Sy".to_owned(), PdfObject::Name(symbol));
+            }
         }
 
         d
@@ -220,24 +335,195 @@ fn insert_quad_points(d: &mut PdfDict, qp: &[f64]) {
     );
 }
 
+fn color_array(c: &[f64; 3]) -> PdfObject {
+    PdfObject::Array(c.iter().map(|&v| PdfObject::Real(v)).collect())
+}
+
+fn border_style_dict(line_width: f64) -> PdfObject {
+    let mut d = PdfDict::new();
+    d.insert("Type".to_owned(), PdfObject::Name("Border".to_owned()));
+    d.insert("W".to_owned(), PdfObject::Real(line_width));
+    PdfObject::Dictionary(d)
+}
+
+/// Build and write an EmbeddedFile stream + Filespec dict to `editor`.
+///
+/// Returns the object ID of the Filespec dictionary (used as the `/FS` value
+/// in the FileAttachment annotation).
+fn build_embedded_file_stream(data: &[u8], filename: &str, editor: &mut PdfEditor) -> Result<u32> {
+    use crate::parser::objects::PdfStream;
+    use crate::writer::streams::encode_flate;
+
+    let compressed = encode_flate(data)?;
+
+    let mut ef_dict = PdfDict::new();
+    ef_dict.insert(
+        "Type".to_owned(),
+        PdfObject::Name("EmbeddedFile".to_owned()),
+    );
+    ef_dict.insert(
+        "Length".to_owned(),
+        PdfObject::Integer(compressed.len() as i64),
+    );
+    ef_dict.insert(
+        "Filter".to_owned(),
+        PdfObject::Name("FlateDecode".to_owned()),
+    );
+    let mut params = PdfDict::new();
+    params.insert("Size".to_owned(), PdfObject::Integer(data.len() as i64));
+    ef_dict.insert("Params".to_owned(), PdfObject::Dictionary(params));
+    let ef_id = editor.add_object(PdfObject::Stream(Box::new(PdfStream {
+        dict: ef_dict,
+        raw_data: compressed,
+    })));
+
+    let mut filespec = PdfDict::new();
+    filespec.insert("Type".to_owned(), PdfObject::Name("Filespec".to_owned()));
+    filespec.insert(
+        "F".to_owned(),
+        PdfObject::String(filename.as_bytes().to_vec()),
+    );
+    filespec.insert(
+        "UF".to_owned(),
+        PdfObject::String(filename.as_bytes().to_vec()),
+    );
+    let mut ef_ref = PdfDict::new();
+    ef_ref.insert("F".to_owned(), PdfObject::Reference(ef_id, 0));
+    filespec.insert("EF".to_owned(), PdfObject::Dictionary(ef_ref));
+
+    Ok(editor.add_object(PdfObject::Dictionary(filespec)))
+}
+
+/// Generate appearance stream bytes for an annotation type.
+///
+/// Returns `None` for types with no visual appearance (Link, Redact).
+/// Gated on the `forms` feature because the appearance functions live there.
+#[cfg(feature = "forms")]
+fn generate_ap_bytes(annot_type: &AnnotationType, rect: [f64; 4]) -> Option<Vec<u8>> {
+    use crate::forms::appearance;
+
+    match annot_type {
+        AnnotationType::Text { .. } => Some(appearance::text_note_appearance(rect)),
+        AnnotationType::Highlight { color, quad_points } => {
+            let quads: Vec<[f64; 8]> = quad_points
+                .chunks(8)
+                .filter(|c| c.len() == 8)
+                .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                .collect();
+            Some(appearance::highlight_appearance_quad(&quads, rect, *color))
+        }
+        AnnotationType::FreeText { contents, .. } => Some(appearance::freetext_appearance(
+            contents,
+            rect,
+            10.0,
+            [0.0, 0.0, 0.0],
+        )),
+        AnnotationType::Ink { ink_list } => {
+            Some(appearance::ink_appearance(ink_list, rect, [0.0, 0.0, 0.0]))
+        }
+        AnnotationType::Stamp { name, color } => {
+            Some(appearance::stamp_appearance(name, rect, *color))
+        }
+        AnnotationType::Polygon {
+            vertices,
+            stroke_color,
+            fill_color,
+            line_width,
+            ..
+        } => Some(appearance::polygon_appearance(
+            vertices,
+            rect,
+            *stroke_color,
+            *fill_color,
+            *line_width,
+        )),
+        AnnotationType::Polyline {
+            vertices,
+            stroke_color,
+            line_width,
+        } => Some(appearance::polyline_appearance(
+            vertices,
+            rect,
+            *stroke_color,
+            *line_width,
+        )),
+        AnnotationType::Caret { .. } => Some(appearance::caret_appearance(rect)),
+        AnnotationType::FileAttachment { icon_name, .. } => {
+            Some(appearance::file_attachment_appearance(rect, icon_name))
+        }
+        // StrikeOut and Underline: visual AP deferred to a future phase.
+        // Link and Redact: no AP stream needed.
+        _ => None,
+    }
+}
+
 // ── Public operations ─────────────────────────────────────────────────────────
 
 /// Add an annotation to page `page_index`.
 ///
 /// Writes the annotation dict as a new object, then updates the page's
-/// `/Annots` array (or creates it). Returns the annotation object ID.
+/// `/Annots` array (or creates it). For `FileAttachment` annotations the
+/// embedded-file stream and Filespec dict are written to the document before
+/// building the annotation dict. Returns the annotation object ID.
 pub fn add_annotation(
     editor: &mut PdfEditor,
     page_index: usize,
-    annot: AnnotationBuilder,
+    mut annot: AnnotationBuilder,
 ) -> Result<u32> {
     #[cfg(feature = "crypto")]
     crate::license::require(crate::license::Tier::Pro, "add_annotation")?;
     let (page_id, mut page_dict) = editor.get_page_dict(page_index)?;
 
+    let rect = annot.rect;
+
+    // Pre-process FileAttachment: build embedded file stream and Filespec dict
+    // before building the annotation dict so the /FS reference is available.
+    {
+        let fs_id = if let AnnotationType::FileAttachment {
+            file_data,
+            filename,
+            ..
+        } = &annot.annot_type
+        {
+            Some(build_embedded_file_stream(file_data, filename, editor)?)
+        } else {
+            None
+        };
+        if let Some(id) = fs_id {
+            annot.prebuilt_ref = Some(id);
+        }
+    }
+
+    // Capture AP bytes before consuming `annot` (requires forms feature).
+    #[cfg(feature = "forms")]
+    let ap_bytes_opt: Option<Vec<u8>> = generate_ap_bytes(&annot.annot_type, rect);
+
     // Build the annotation dict, including a back-reference to the page.
     let mut annot_dict = annot.build();
     annot_dict.insert("P".to_owned(), PdfObject::Reference(page_id, 0));
+
+    // Attach an appearance stream (/AP) when one was generated.
+    #[cfg(feature = "forms")]
+    if let Some(ap_bytes) = ap_bytes_opt {
+        let w = rect[2] - rect[0];
+        let h = rect[3] - rect[1];
+        let mut stream_dict = PdfDict::new();
+        stream_dict.insert("Subtype".to_owned(), PdfObject::Name("Form".to_owned()));
+        stream_dict.insert(
+            "BBox".to_owned(),
+            PdfObject::Array(vec![
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(w),
+                PdfObject::Real(h),
+            ]),
+        );
+        let ap_stream = make_flate_stream(&ap_bytes, stream_dict)?;
+        let ap_id = editor.add_object(PdfObject::Stream(Box::new(ap_stream)));
+        let mut ap_dict = PdfDict::new();
+        ap_dict.insert("N".to_owned(), PdfObject::Reference(ap_id, 0));
+        annot_dict.insert("AP".to_owned(), PdfObject::Dictionary(ap_dict));
+    }
 
     let annot_id = editor.add_object(PdfObject::Dictionary(annot_dict));
 
@@ -460,6 +746,83 @@ fn flatten_one_annotation(cb: &mut ContentBuilder, dict: &PdfDict, subtype: &str
                     }
                 }
             }
+        }
+        "Stamp" => {
+            let name = match dict.get("Name") {
+                Some(PdfObject::Name(n)) => n.clone(),
+                _ => "STAMP".to_owned(),
+            };
+            let font_size = ((rect[3] - rect[1]) * 0.6).clamp(8.0, 24.0);
+            cb.save()
+                .set_stroke_rgb(color[0], color[1], color[2])
+                .set_line_width(1.5)
+                .rect(
+                    rect[0] + 2.0,
+                    rect[1] + 2.0,
+                    rect[2] - rect[0] - 4.0,
+                    rect[3] - rect[1] - 4.0,
+                )
+                .stroke()
+                .set_fill_rgb(color[0], color[1], color[2])
+                .begin_text()
+                .set_font("Helv", font_size)
+                .move_text_pos(rect[0] + 4.0, rect[1] + 2.0)
+                .show_text(name.as_bytes())
+                .end_text()
+                .restore();
+        }
+        "Polygon" | "PolyLine" => {
+            if let Some(PdfObject::Array(verts)) = dict.get("Vertices") {
+                let coords: Vec<f64> = verts.iter().filter_map(pdf_num).collect();
+                if coords.len() >= 4 {
+                    let lw = if let Some(PdfObject::Dictionary(bs)) = dict.get("BS") {
+                        match bs.get("W") {
+                            Some(PdfObject::Real(w)) => *w,
+                            Some(PdfObject::Integer(w)) => *w as f64,
+                            _ => 1.0,
+                        }
+                    } else {
+                        1.0
+                    };
+                    cb.set_stroke_rgb(color[0], color[1], color[2])
+                        .set_line_width(lw)
+                        .move_to(coords[0], coords[1]);
+                    let mut i = 2;
+                    while i + 1 < coords.len() {
+                        cb.line_to(coords[i], coords[i + 1]);
+                        i += 2;
+                    }
+                    if subtype == "Polygon" {
+                        cb.close_path();
+                    }
+                    cb.stroke();
+                }
+            }
+        }
+        "Caret" => {
+            let w = rect[2] - rect[0];
+            let h = rect[3] - rect[1];
+            cb.save()
+                .set_stroke_rgb(0.0, 0.0, 0.5)
+                .set_line_width(1.0)
+                .move_to(rect[0], rect[1])
+                .line_to(rect[0] + w / 2.0, rect[1] + h)
+                .line_to(rect[0] + w, rect[1])
+                .stroke()
+                .restore();
+        }
+        "FileAttachment" => {
+            let cx = (rect[0] + rect[2]) / 2.0;
+            let h = rect[3] - rect[1];
+            let w = rect[2] - rect[0];
+            cb.save()
+                .set_fill_rgb(0.5, 0.5, 0.5)
+                .rect(cx - 2.0, rect[1], 4.0, h * 0.6)
+                .fill()
+                .set_fill_rgb(0.3, 0.3, 0.3)
+                .rect(cx - w * 0.25, rect[1] + h * 0.55, w * 0.5, h * 0.4)
+                .fill()
+                .restore();
         }
         // Link, Text (sticky-note icon), Redact, Widget — non-visual or handled elsewhere.
         _ => {}

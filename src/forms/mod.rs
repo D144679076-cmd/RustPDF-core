@@ -4,6 +4,7 @@
 
 pub mod acroform;
 pub mod appearance;
+pub mod fdf;
 pub mod filler;
 pub mod reader;
 
@@ -12,8 +13,11 @@ pub use acroform::{
     AcroFormBuilder,
 };
 pub use appearance::{
-    checkbox_appearance, highlight_appearance, radio_appearance, text_field_appearance,
+    caret_appearance, checkbox_appearance, file_attachment_appearance, freetext_appearance,
+    highlight_appearance, highlight_appearance_quad, ink_appearance, polygon_appearance,
+    polyline_appearance, radio_appearance, stamp_appearance, text_field_appearance,
     text_note_appearance,
 };
+pub use fdf::{export_fdf, export_xfdf, import_fdf, import_xfdf};
 pub use filler::{set_checkbox, set_combo_or_list, set_text_field};
 pub use reader::{read_form_fields, FieldType, FormField};

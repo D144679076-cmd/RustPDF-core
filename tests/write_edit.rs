@@ -375,6 +375,98 @@ mod editor_tests {
         let doc = PdfDocument::parse(result).unwrap();
         assert_eq!(doc.page_count().unwrap(), before);
     }
+
+    // ── Phase 2: new annotation types ─────────────────────────────────────────
+
+    #[test]
+    fn add_stamp_annotation_parseable() {
+        super::ensure_pro_license();
+        let original = fixture("minimal.pdf");
+        let mut editor = PdfEditor::open(original.clone()).unwrap();
+        add_blank_page(&mut editor, 0, 595.0, 842.0).unwrap();
+        let builder = AnnotationBuilder::new(
+            AnnotationType::Stamp {
+                name: "Draft".to_owned(),
+                color: [1.0, 0.0, 0.0],
+            },
+            [50.0, 700.0, 250.0, 740.0],
+        );
+        let annot_id = add_annotation(&mut editor, 0, builder).unwrap();
+        assert!(annot_id > 0);
+        // Verify the annotation dict has the correct subtype before saving.
+        let annot_obj = editor.get_object(annot_id).unwrap();
+        if let PdfObject::Dictionary(d) = annot_obj {
+            assert_eq!(d.get("Subtype"), Some(&PdfObject::Name("Stamp".to_owned())));
+        } else {
+            panic!("expected annotation dictionary");
+        }
+        // Saved PDF must re-parse without error.
+        let result = editor.save_append(&original).unwrap();
+        PdfDocument::parse(result).unwrap();
+    }
+
+    #[test]
+    fn add_polygon_annotation_parseable() {
+        super::ensure_pro_license();
+        let original = fixture("minimal.pdf");
+        let mut editor = PdfEditor::open(original.clone()).unwrap();
+        add_blank_page(&mut editor, 0, 595.0, 842.0).unwrap();
+        let builder = AnnotationBuilder::new(
+            AnnotationType::Polygon {
+                vertices: vec![[100.0, 100.0], [200.0, 100.0], [150.0, 200.0]],
+                closed: true,
+                stroke_color: [0.0, 0.0, 1.0],
+                fill_color: Some([0.8, 0.8, 1.0]),
+                line_width: 1.5,
+            },
+            [100.0, 100.0, 200.0, 200.0],
+        );
+        let annot_id = add_annotation(&mut editor, 0, builder).unwrap();
+        assert!(annot_id > 0);
+        let annot_obj = editor.get_object(annot_id).unwrap();
+        if let PdfObject::Dictionary(d) = annot_obj {
+            assert_eq!(
+                d.get("Subtype"),
+                Some(&PdfObject::Name("Polygon".to_owned()))
+            );
+        } else {
+            panic!("expected annotation dictionary");
+        }
+        let result = editor.save_append(&original).unwrap();
+        PdfDocument::parse(result).unwrap();
+    }
+
+    #[test]
+    fn add_file_attachment_parseable() {
+        super::ensure_pro_license();
+        let original = fixture("minimal.pdf");
+        let mut editor = PdfEditor::open(original.clone()).unwrap();
+        add_blank_page(&mut editor, 0, 595.0, 842.0).unwrap();
+        let builder = AnnotationBuilder::new(
+            AnnotationType::FileAttachment {
+                file_data: b"hello world".to_vec(),
+                filename: "note.txt".to_owned(),
+                description: "A small text file".to_owned(),
+                icon_name: "PushPin".to_owned(),
+            },
+            [20.0, 20.0, 40.0, 40.0],
+        );
+        let annot_id = add_annotation(&mut editor, 0, builder).unwrap();
+        assert!(annot_id > 0);
+        let annot_obj = editor.get_object(annot_id).unwrap();
+        if let PdfObject::Dictionary(d) = annot_obj {
+            assert_eq!(
+                d.get("Subtype"),
+                Some(&PdfObject::Name("FileAttachment".to_owned()))
+            );
+            // Must carry a /FS reference to the embedded Filespec dict.
+            assert!(d.contains_key("FS"), "FileAttachment must have /FS");
+        } else {
+            panic!("expected annotation dictionary");
+        }
+        let result = editor.save_append(&original).unwrap();
+        PdfDocument::parse(result).unwrap();
+    }
 }
 
 #[cfg(feature = "forms")]
@@ -445,6 +537,39 @@ mod forms_tests {
             .find(|f| f.full_name == cb.full_name)
             .unwrap();
         assert!(updated.checked, "checkbox should now be checked");
+    }
+
+    // ── Phase 2: appearance streams ───────────────────────────────────────────
+
+    #[test]
+    fn annotations_have_ap_streams() {
+        super::ensure_pro_license();
+        let original = std::fs::read(format!(
+            "{}/tests/fixtures/minimal.pdf",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut editor = pdf_core::editor::PdfEditor::open(original.clone()).unwrap();
+        pdf_core::editor::add_blank_page(&mut editor, 0, 595.0, 842.0).unwrap();
+        let builder = pdf_core::editor::AnnotationBuilder::new(
+            pdf_core::editor::AnnotationType::Highlight {
+                color: [1.0, 1.0, 0.0],
+                quad_points: vec![50.0, 700.0, 200.0, 700.0, 50.0, 715.0, 200.0, 715.0],
+            },
+            [50.0, 700.0, 200.0, 715.0],
+        );
+        let annot_id = pdf_core::editor::add_annotation(&mut editor, 0, builder).unwrap();
+        let result = editor.save_append(&original).unwrap();
+        let doc = pdf_core::parser::objects::PdfDocument::parse(result).unwrap();
+        let obj = doc.get_object(annot_id).unwrap();
+        if let pdf_core::parser::objects::PdfObject::Dictionary(d) = obj {
+            assert!(
+                d.contains_key("AP"),
+                "Highlight annotation must have an /AP appearance stream"
+            );
+        } else {
+            panic!("expected annotation dictionary");
+        }
     }
 
     // ── Original write tests ──────────────────────────────────────────────────

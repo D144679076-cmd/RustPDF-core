@@ -1,6 +1,6 @@
 # Phase 2 — Digital Signatures (PKCS#7 / PAdES)
 
-**Status:** Not started
+**Status:** Complete — 2026-06-12
 **Effort:** ~3–4 months
 **Tier gate:** Enterprise
 **New Cargo.toml feature:** `signatures`

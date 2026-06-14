@@ -68,6 +68,7 @@ pub struct EditBlock {
     /// in-content CTM, since `x`/`y` alone fold the CTM in and can't be inverted.
     /// When `synthetic_italic` is true, the shear component has already been
     /// stripped so re-commit applies exactly one shear.
+    #[allow(dead_code)]
     pub(crate) tm: Matrix,
     /// Whether the block carries synthetic italic (a `Tm` shear in the content
     /// stream) that is not intrinsic to the font (i.e. `italic == false`).

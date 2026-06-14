@@ -449,6 +449,15 @@ impl PdfDocument {
         ))
     }
 
+    /// Return a reference to the raw PDF bytes backing this document.
+    ///
+    /// Required by the signature verifier to hash the signed byte ranges
+    /// (ISO 32000-1 §12.8.1 — the `/ByteRange` covers specific regions of the
+    /// original byte stream, not a re-serialized form).
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Whether the document carries at least one digital signature.
     ///
     /// Detected via the catalog's `/AcroForm /SigFlags`, bit 1

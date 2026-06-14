@@ -26,6 +26,8 @@ aes = { version = "0.8", optional = true }
 cbc = { version = "0.1", optional = true }
 hmac = { version = "0.12", optional = true }
 base64 = { version = "0.21", optional = true }
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
+x509-cert = { version = "0.2", optional = true }
 # Random IV source for AES-CBC encryption on write. The `js` feature routes to
 # `crypto.getRandomValues` on wasm32; native targets use the OS RNG.
 getrandom = { version = "0.2", features = ["js"], optional = true }
@@ -42,6 +44,7 @@ crypto = ["dep:md-5", "dep:sha2", "dep:aes", "dep:cbc", "dep:hmac", "dep:base64"
 render = ["dep:tiny-skia", "dep:fontdue", "dep:zune-jpeg"]
 writer = []
 forms  = ["writer"]
+signatures = ["dep:rsa", "dep:x509-cert", "crypto", "writer"]
 # WASM bridge: exposes #[wasm_bindgen] types for JS integration.
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto"]
 # WASM bridge with page rendering included (adds ~800 KB to the WASM binary).
@@ -61,6 +64,7 @@ required-features = ["crypto"]
 [dev-dependencies]
 pretty_assertions = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [[bench]]
 name = "render_bench"

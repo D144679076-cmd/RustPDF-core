@@ -1,6 +1,6 @@
 # Phase 2 — Missing Annotation Types + Appearance Streams
 
-**Status:** Not started
+**Status:** Complete — 2026-06-14
 **Effort:** ~3 weeks
 **Tier gate:** Pro
 

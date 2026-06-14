@@ -384,6 +384,7 @@ impl PdfEditor {
         // Compute /Size: must exceed the highest ID in the entire file.
         let writer_max = offsets.iter().map(|(id, _)| *id).max().unwrap_or(0);
         let doc_max = self.doc.max_object_id();
+        #[cfg_attr(not(feature = "crypto"), allow(unused_mut))]
         let mut size = writer_max.max(doc_max) + 1;
 
         // Encrypted incremental update: the new (first-read) trailer must reference

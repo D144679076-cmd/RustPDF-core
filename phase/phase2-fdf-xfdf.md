@@ -1,6 +1,6 @@
 # Phase 2 — FDF / XFDF Import & Export
 
-**Status:** Not started
+**Status:** Complete — 2026-06-12
 **Effort:** ~3 weeks
 **Tier gate:** Pro
 

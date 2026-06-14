@@ -28,6 +28,8 @@ pub mod license;
 pub mod parser;
 #[cfg(feature = "render")]
 pub mod render;
+#[cfg(feature = "signatures")]
+pub mod signatures;
 pub mod text;
 #[cfg(feature = "wasm")]
 pub mod wasm;

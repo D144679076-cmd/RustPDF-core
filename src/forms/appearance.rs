@@ -164,6 +164,220 @@ fn escape_pdf_string(s: &str) -> String {
         .replace(')', "\\)")
 }
 
+// ── Stamp ─────────────────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a stamp annotation.
+///
+/// Draws a coloured border rectangle with the stamp label centred inside.
+/// `rect` is the annotation bounding box; `color` is the RGB border/text colour.
+pub fn stamp_appearance(name: &str, rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [x1, y1, x2, y2] = rect;
+    let w = x2 - x1;
+    let h = y2 - y1;
+    let font_size = (h * 0.6).clamp(8.0, 24.0);
+    let approx_text_width = font_size * 0.55 * name.len() as f64;
+    let cx = (w / 2.0 - approx_text_width / 2.0).max(2.0);
+    let cy = ((h - font_size) / 2.0).max(2.0);
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_stroke_rgb(color[0], color[1], color[2])
+        .set_line_width(1.5)
+        .rect(2.0, 2.0, w - 4.0, h - 4.0)
+        .stroke()
+        .set_fill_rgb(color[0], color[1], color[2])
+        .begin_text()
+        .set_font("Helv", font_size)
+        .move_text_pos(cx, cy)
+        .show_text(name.as_bytes())
+        .end_text()
+        .restore();
+    b.build()
+}
+
+// ── FreeText ──────────────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a FreeText annotation.
+///
+/// Renders `text` at `font_size` in the given `color` inside the annotation bbox.
+pub fn freetext_appearance(text: &str, rect: [f64; 4], font_size: f64, color: [f64; 3]) -> Vec<u8> {
+    let [_x1, y1, _x2, y2] = rect;
+    let h = y2 - y1;
+    let y_pos = (h - font_size - 2.0).max(2.0);
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_fill_rgb(color[0], color[1], color[2])
+        .begin_text()
+        .set_font("Helv", font_size)
+        .move_text_pos(2.0, y_pos)
+        .show_text(escape_pdf_string(text).as_bytes())
+        .end_text()
+        .restore();
+    b.build()
+}
+
+// ── Ink ───────────────────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for an Ink (freehand) annotation.
+///
+/// `ink_list` is a list of strokes; each stroke is a list of `[x, y]` points
+/// in page space. `bbox` is the annotation bounding box (used as origin offset).
+pub fn ink_appearance(ink_list: &[Vec<[f64; 2]>], bbox: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [ox, oy, _, _] = bbox;
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_stroke_rgb(color[0], color[1], color[2])
+        .set_line_width(1.5);
+    for stroke in ink_list {
+        if stroke.len() < 2 {
+            continue;
+        }
+        b.move_to(stroke[0][0] - ox, stroke[0][1] - oy);
+        for pt in &stroke[1..] {
+            b.line_to(pt[0] - ox, pt[1] - oy);
+        }
+        b.stroke();
+    }
+    b.restore();
+    b.build()
+}
+
+// ── Highlight (quad-based) ────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a Highlight annotation using QuadPoints.
+///
+/// Each entry in `quad_points` is 8 coordinates `[x1,y1, x2,y2, x3,y3, x4,y4]`
+/// (lower-left, lower-right, upper-left, upper-right in page space).
+/// `bbox` is the annotation bounding box used as the local coordinate origin.
+pub fn highlight_appearance_quad(
+    quad_points: &[[f64; 8]],
+    bbox: [f64; 4],
+    color: [f64; 3],
+) -> Vec<u8> {
+    let [ox, oy, _, _] = bbox;
+    let mut b = ContentBuilder::new();
+    b.save().set_fill_rgb(color[0], color[1], color[2]);
+    for quad in quad_points {
+        let x = quad[0].min(quad[2]).min(quad[4]).min(quad[6]) - ox;
+        let y = quad[1].min(quad[3]).min(quad[5]).min(quad[7]) - oy;
+        let w = quad[0].max(quad[2]).max(quad[4]).max(quad[6]) - ox - x;
+        let h = quad[1].max(quad[3]).max(quad[5]).max(quad[7]) - oy - y;
+        b.rect(x, y, w, h).fill();
+    }
+    b.restore();
+    b.build()
+}
+
+// ── Polygon / Polyline ────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a Polygon annotation.
+///
+/// `vertices` are page-space `[x, y]` points. `rect` is the annotation bounding
+/// box (subtracted to produce form-XObject-local coordinates). The path is
+/// always closed; fill is applied when `fill_color` is `Some`.
+pub fn polygon_appearance(
+    vertices: &[[f64; 2]],
+    rect: [f64; 4],
+    stroke_color: [f64; 3],
+    fill_color: Option<[f64; 3]>,
+    line_width: f64,
+) -> Vec<u8> {
+    if vertices.len() < 2 {
+        return vec![];
+    }
+    let [ox, oy, _, _] = rect;
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_stroke_rgb(stroke_color[0], stroke_color[1], stroke_color[2])
+        .set_line_width(line_width);
+    if let Some(fc) = fill_color {
+        b.set_fill_rgb(fc[0], fc[1], fc[2]);
+    }
+    b.move_to(vertices[0][0] - ox, vertices[0][1] - oy);
+    for v in &vertices[1..] {
+        b.line_to(v[0] - ox, v[1] - oy);
+    }
+    b.close_path();
+    if fill_color.is_some() {
+        b.fill_stroke();
+    } else {
+        b.stroke();
+    }
+    b.restore();
+    b.build()
+}
+
+/// Generate an appearance stream for a Polyline annotation.
+///
+/// Like `polygon_appearance` but the path is left open (no close-path).
+pub fn polyline_appearance(
+    vertices: &[[f64; 2]],
+    rect: [f64; 4],
+    stroke_color: [f64; 3],
+    line_width: f64,
+) -> Vec<u8> {
+    if vertices.len() < 2 {
+        return vec![];
+    }
+    let [ox, oy, _, _] = rect;
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_stroke_rgb(stroke_color[0], stroke_color[1], stroke_color[2])
+        .set_line_width(line_width)
+        .move_to(vertices[0][0] - ox, vertices[0][1] - oy);
+    for v in &vertices[1..] {
+        b.line_to(v[0] - ox, v[1] - oy);
+    }
+    b.stroke().restore();
+    b.build()
+}
+
+// ── Caret ─────────────────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a Caret annotation.
+///
+/// Draws a simple ^ (up-caret) shape within the annotation bounding box.
+pub fn caret_appearance(rect: [f64; 4]) -> Vec<u8> {
+    let [x1, y1, x2, y2] = rect;
+    let w = x2 - x1;
+    let h = y2 - y1;
+    let mut b = ContentBuilder::new();
+    b.save()
+        .set_stroke_rgb(0.0, 0.0, 0.5)
+        .set_line_width(1.0)
+        .move_to(0.0, 0.0)
+        .line_to(w / 2.0, h)
+        .line_to(w, 0.0)
+        .stroke()
+        .restore();
+    b.build()
+}
+
+// ── FileAttachment ────────────────────────────────────────────────────────────
+
+/// Generate an appearance stream for a FileAttachment annotation.
+///
+/// Draws a simple pin-like icon centred in the annotation bounding box.
+/// The `_icon_name` parameter is accepted for future per-icon rendering but
+/// currently all icons render as the same push-pin shape.
+pub fn file_attachment_appearance(rect: [f64; 4], _icon_name: &str) -> Vec<u8> {
+    let [x1, y1, x2, y2] = rect;
+    let w = x2 - x1;
+    let h = y2 - y1;
+    let cx = w / 2.0;
+    let mut b = ContentBuilder::new();
+    b.save()
+        // Pin body
+        .set_fill_rgb(0.5, 0.5, 0.5)
+        .rect(cx - 2.0, 0.0, 4.0, h * 0.6)
+        .fill()
+        // Pin head
+        .set_fill_rgb(0.3, 0.3, 0.3)
+        .rect(cx - w * 0.25, h * 0.55, w * 0.5, h * 0.4)
+        .fill()
+        .restore();
+    b.build()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

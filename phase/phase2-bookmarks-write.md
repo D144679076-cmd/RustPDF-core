@@ -1,6 +1,6 @@
 # Phase 2 — Bookmarks Write API
 
-**Status:** Not started
+**Status:** Complete — 2026-06-12
 **Effort:** ~2 weeks
 
 ## Context

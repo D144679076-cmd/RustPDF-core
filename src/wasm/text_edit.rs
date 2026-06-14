@@ -26,6 +26,7 @@ pub(crate) struct ActiveTextEdit {
     /// The raw `font_metrics_for` result (None when the font can't be resolved),
     /// cached so per-keystroke `text_edit_render_block` reuses it instead of
     /// re-inverting the ToUnicode CMap on every keystroke.
+    #[allow(dead_code)]
     pub render_metrics: Option<PdfFontMetrics>,
     /// Block origin x (PDF user-space) — caret x is added to this.
     pub x: f64,

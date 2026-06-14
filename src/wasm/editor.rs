@@ -638,6 +638,65 @@ impl WasmEditor {
         Ok(())
     }
 
+    /// Add a stamp annotation to a page.
+    ///
+    /// `name` is the stamp label, e.g. "Approved", "Draft", "Confidential".
+    /// `r`, `g`, `b` are the stamp colour components [0.0–1.0].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_stamp(
+        &mut self,
+        page_index: usize,
+        name: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+    ) -> Result<(), JsError> {
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::Stamp {
+                name: name.to_string(),
+                color: [r, g, b],
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Embed a file in the PDF as a FileAttachment annotation on the given page.
+    ///
+    /// `file_bytes` is the raw file content; `filename` is the embedded file name
+    /// shown in the attachment panel; `description` is the annotation tooltip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_file_attachment(
+        &mut self,
+        page_index: usize,
+        file_bytes: &[u8],
+        filename: &str,
+        description: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<(), JsError> {
+        let builder = crate::editor::AnnotationBuilder::new(
+            crate::editor::AnnotationType::FileAttachment {
+                file_data: file_bytes.to_vec(),
+                filename: filename.to_string(),
+                description: description.to_string(),
+                icon_name: "PushPin".to_string(),
+            },
+            [x, y, x + width, y + height],
+        );
+        crate::editor::add_annotation(&mut self.editor, page_index, builder)
+            .map(|_| ())
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Flatten all annotations on a single page into the content stream.
     ///
     /// After this call the page has no `/Annots` and annotation visuals are
@@ -957,6 +1016,58 @@ impl WasmEditor {
             .ok_or_else(|| JsError::new(&format!("field '{}' not found", field_name)))
     }
 
+    // ── FDF / XFDF ───────────────────────────────────────────────────────────
+
+    /// Export all form field values as FDF bytes.
+    ///
+    /// Returns a valid FDF 1.2 file that can be saved to disk or passed back
+    /// to [`import_fdf`] for a round-trip. Requires a Pro license.
+    pub fn export_fdf(&self) -> Result<js_sys::Uint8Array, JsError> {
+        crate::forms::export_fdf(&self.editor.doc)
+            .map(|v| js_sys::Uint8Array::from(v.as_slice()))
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Import FDF bytes and fill the matching form fields.
+    ///
+    /// Fields not present in the FDF are left unchanged. Requires a Pro license
+    /// (enforced per-field by the underlying `set_*` helpers).
+    pub fn import_fdf(&mut self, fdf_bytes: &[u8]) -> Result<(), JsError> {
+        crate::forms::import_fdf(&mut self.editor, fdf_bytes)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Export all form field values as an XFDF string.
+    ///
+    /// Returns a valid XFDF 1.0 XML document. Requires a Pro license.
+    pub fn export_xfdf(&self) -> Result<String, JsError> {
+        crate::forms::export_xfdf(&self.editor.doc).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Import an XFDF string and fill the matching form fields.
+    ///
+    /// Fields not present in the XFDF are left unchanged. Requires a Pro
+    /// license (enforced per-field by the underlying `set_*` helpers).
+    pub fn import_xfdf(&mut self, xfdf_str: &str) -> Result<(), JsError> {
+        crate::forms::import_xfdf(&mut self.editor, xfdf_str)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Bookmarks ────────────────────────────────────────────────────────────
+
+    /// Replace the document outline (bookmarks) from a JSON array.
+    ///
+    /// Each element: `{ "title": string, "page_index": number, "y_position": number,
+    /// "open": bool, "bold": bool, "italic": bool, "color": [r,g,b] | null,
+    /// "children": [...] }`.
+    ///
+    /// Pass `"[]"` to remove all bookmarks.
+    pub fn set_outline(&mut self, outline_json: &str) -> Result<(), JsError> {
+        let entries = parse_outline_json(outline_json).map_err(|e| JsError::new(&e.to_string()))?;
+        crate::document::set_document_outline(&mut self.editor, &entries)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     // ── Save ─────────────────────────────────────────────────────────────────
 
     /// Serialise the edited document as PDF bytes (incremental update).
@@ -1037,6 +1148,91 @@ impl WasmEditor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Digital signature WASM bindings (requires `signatures` feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "signatures")]
+#[wasm_bindgen]
+impl WasmEditor {
+    /// Sign the PDF and return the signed bytes as a `Uint8Array`.
+    ///
+    /// - `private_key_der` — PKCS#8 RSA private key in DER.
+    /// - `cert_der` — Signer X.509 certificate in DER.
+    /// - `field_name` — PDF field name for the signature widget (`/T`).
+    /// - `page_index` — 0-based page on which to place the widget.
+    /// - `x1`, `y1`, `x2`, `y2` — Widget rectangle in PDF user space.
+    ///
+    /// Requires an Enterprise license.
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_pdf(
+        &self,
+        private_key_der: &[u8],
+        cert_der: &[u8],
+        field_name: &str,
+        page_index: usize,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> Result<js_sys::Uint8Array, JsError> {
+        let options = crate::signatures::SignatureOptions {
+            rect: [x1, y1, x2, y2],
+            page_index,
+            field_name: field_name.to_owned(),
+            reason: None,
+            location: None,
+            contact_info: None,
+        };
+        let signed = crate::signatures::sign_document(
+            &self.original_bytes,
+            private_key_der,
+            cert_der,
+            &options,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(js_sys::Uint8Array::from(signed.as_slice()))
+    }
+
+    /// Verify all digital signatures in the currently loaded PDF.
+    ///
+    /// Returns a JSON array of objects:
+    /// `[{"field_name":"Sig1","valid":true,"covers_whole_file":true,"signer_name":"Alice"}]`
+    #[wasm_bindgen]
+    pub fn verify_signatures(&self) -> Result<String, JsError> {
+        let results = crate::signatures::verify_signatures(&self.original_bytes)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(sigs_to_json(&results))
+    }
+}
+
+#[cfg(feature = "signatures")]
+fn sigs_to_json(results: &[crate::signatures::SignatureVerification]) -> String {
+    let items: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let signer = match &r.signer_name {
+                Some(n) => format!(",\"signer_name\":{}", super::json_str(n)),
+                None => String::new(),
+            };
+            let error = match &r.error {
+                Some(e) => format!(",\"error\":{}", super::json_str(e)),
+                None => String::new(),
+            };
+            format!(
+                "{{\"field_name\":{},\"valid\":{},\"covers_whole_file\":{}{}{}}}",
+                super::json_str(&r.field_name),
+                r.signature_valid,
+                r.covers_whole_file,
+                signer,
+                error,
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn frames_to_json(
@@ -1079,6 +1275,294 @@ fn frames_to_json(
         })
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+// ---------------------------------------------------------------------------
+// Outline JSON parser (for set_outline)
+// ---------------------------------------------------------------------------
+
+/// Parse a JSON array of outline entries into `Vec<OutlineEntry>`.
+///
+/// Accepts the format described in [`WasmEditor::set_outline`].
+fn parse_outline_json(json: &str) -> crate::error::Result<Vec<crate::document::OutlineEntry>> {
+    parse_outline_array(json.trim())
+}
+
+fn parse_outline_array(s: &str) -> crate::error::Result<Vec<crate::document::OutlineEntry>> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return Err(crate::error::PdfError::invalid_structure(
+            "outline JSON must be an array",
+        ));
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    let bytes = inner.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape_next = true,
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    let chunk = inner[start..=i].trim();
+                    if !chunk.is_empty() {
+                        entries.push(parse_outline_object(chunk)?);
+                    }
+                    start = i + 1;
+                    // skip the comma after closing brace
+                    if start < bytes.len() && bytes[start] == b',' {
+                        start += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_outline_object(s: &str) -> crate::error::Result<crate::document::OutlineEntry> {
+    let title = json_str_field(s, "title")?.unwrap_or_default();
+    let page_index = json_usize_field(s, "page_index")?.unwrap_or(0);
+    let y_position = json_f64_field(s, "y_position")?.unwrap_or(0.0);
+    let open = json_bool_field(s, "open")?.unwrap_or(false);
+    let bold = json_bool_field(s, "bold")?.unwrap_or(false);
+    let italic = json_bool_field(s, "italic")?.unwrap_or(false);
+    let color = json_color_field(s, "color")?;
+    let children = json_children_field(s)?;
+
+    Ok(crate::document::OutlineEntry {
+        title,
+        page_index,
+        y_position,
+        open,
+        bold,
+        italic,
+        color,
+        children,
+    })
+}
+
+/// Extract a JSON string field value.
+fn json_str_field(obj: &str, key: &str) -> crate::error::Result<Option<String>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?;
+    let rest = rest.trim_start();
+    if rest.starts_with('"') {
+        Ok(Some(parse_json_string(rest)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extract a JSON number as usize.
+fn json_usize_field(obj: &str, key: &str) -> crate::error::Result<Option<usize>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?
+        .trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let num_str = &rest[..end];
+    if num_str.is_empty() {
+        return Ok(None);
+    }
+    num_str
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| crate::error::PdfError::invalid_structure("invalid usize in JSON"))
+}
+
+/// Extract a JSON number as f64.
+fn json_f64_field(obj: &str, key: &str) -> crate::error::Result<Option<f64>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?
+        .trim_start();
+    let end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
+        .unwrap_or(rest.len());
+    let num_str = &rest[..end];
+    if num_str.is_empty() {
+        return Ok(None);
+    }
+    num_str
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|_| crate::error::PdfError::invalid_structure("invalid f64 in JSON"))
+}
+
+/// Extract a JSON boolean field.
+fn json_bool_field(obj: &str, key: &str) -> crate::error::Result<Option<bool>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?
+        .trim_start();
+    if rest.starts_with("true") {
+        Ok(Some(true))
+    } else if rest.starts_with("false") {
+        Ok(Some(false))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extract `"color": [r, g, b]` or `null`.
+fn json_color_field(obj: &str, key: &str) -> crate::error::Result<Option<[f64; 3]>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?
+        .trim_start();
+    if rest.starts_with("null") {
+        return Ok(None);
+    }
+    if !rest.starts_with('[') {
+        return Ok(None);
+    }
+    let end = rest
+        .find(']')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("unclosed color array"))?;
+    let inner = &rest[1..end];
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    let r = parts[0]
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::error::PdfError::invalid_structure("invalid color component"))?;
+    let g = parts[1]
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::error::PdfError::invalid_structure("invalid color component"))?;
+    let b = parts[2]
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::error::PdfError::invalid_structure("invalid color component"))?;
+    Ok(Some([r, g, b]))
+}
+
+/// Extract the `"children"` array (recursive).
+fn json_children_field(obj: &str) -> crate::error::Result<Vec<crate::document::OutlineEntry>> {
+    let needle = "\"children\"";
+    let Some(pos) = obj.find(needle) else {
+        return Ok(Vec::new());
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after 'children'"))?
+        .trim_start();
+    if !rest.starts_with('[') {
+        return Ok(Vec::new());
+    }
+    // Find the matching ']' respecting nesting.
+    let mut depth = 0i32;
+    let mut end = 0usize;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, b) in rest.bytes().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape_next = true,
+            b'"' => in_string = !in_string,
+            b'[' if !in_string => depth += 1,
+            b']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    parse_outline_array(&rest[..=end])
+}
+
+/// Parse a quoted JSON string starting at `s` (which must start with `"`).
+fn parse_json_string(s: &str) -> crate::error::Result<String> {
+    let mut chars = s.chars().peekable();
+    if chars.next() != Some('"') {
+        return Err(crate::error::PdfError::invalid_structure(
+            "expected opening quote",
+        ));
+    }
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            None => {
+                return Err(crate::error::PdfError::invalid_structure(
+                    "unterminated JSON string",
+                ))
+            }
+            Some('"') => break,
+            Some('\\') => match chars.next() {
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| {
+                        crate::error::PdfError::invalid_structure("invalid \\u escape")
+                    })?;
+                    result.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                }
+                _ => {}
+            },
+            Some(c) => result.push(c),
+        }
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
