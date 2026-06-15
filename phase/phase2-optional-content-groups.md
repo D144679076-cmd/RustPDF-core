@@ -1,6 +1,6 @@
 # Phase 2 — Optional Content Groups (PDF Layers)
 
-**Status:** Not started
+**Status:** Complete — 2026-06-16
 **Effort:** ~4 weeks
 **Tier gate:** Pro
 
