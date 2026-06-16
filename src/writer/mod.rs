@@ -7,6 +7,8 @@ pub mod document;
 pub mod font;
 pub mod font_subset;
 pub mod image;
+#[cfg(feature = "crypto")]
+pub mod optimizer;
 pub mod page;
 pub mod serializer;
 pub mod streams;

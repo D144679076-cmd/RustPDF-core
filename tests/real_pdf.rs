@@ -230,6 +230,28 @@ mod render_tests {
         assert_eq!(h2, h1 * 2);
     }
 
+    /// Group-3.pdf contains ExtGState /SMask entries (PPTX-exported gradients).
+    /// Verify: renders without panic, produces non-white pixels.
+    #[test]
+    fn render_group3_with_soft_mask_does_not_panic() {
+        let path = fixtures_dir().join("Group-3.pdf");
+        if !path.exists() {
+            return; // fixture absent in CI; skip
+        }
+        let data = std::fs::read(&path).unwrap();
+        let doc = PdfDocument::parse(data).unwrap();
+        let (w, h, rgba) = render_page_rgba(&doc, 0, 1.0).unwrap();
+        assert!(w > 0 && h > 0, "zero-size output from Group-3.pdf");
+        // Page must have non-white pixels — soft mask transparency makes content visible.
+        let all_white = rgba
+            .chunks_exact(4)
+            .all(|px| px[0] == 255 && px[1] == 255 && px[2] == 255);
+        assert!(
+            !all_white,
+            "Group-3.pdf rendered all-white (soft mask may have erased content)"
+        );
+    }
+
     /// Render the first page of each PPTX-exported fixture and verify the output
     /// is not a single solid colour (which would indicate that background shapes
     /// are covering all content due to clip or compositing bugs).
@@ -298,6 +320,51 @@ fn aes256_encrypted_pdf_build_edit_session_succeeds() {
         "build_edit_session failed on encrypted PDF: {:?}",
         result.err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "crypto")]
+#[test]
+fn unencrypted_pdf_has_no_permission_restrictions() {
+    let data = include_bytes!("fixtures/minimal.pdf").to_vec();
+    let doc = PdfDocument::parse(data).unwrap();
+    // Unencrypted → no Encrypt dict → permissions() is None (no restrictions).
+    assert!(doc.permissions().is_none());
+}
+
+#[cfg(feature = "crypto")]
+#[test]
+fn restricted_pdf_permissions_parsed() {
+    let data = include_bytes!("fixtures/restricted.pdf").to_vec();
+    let doc = PdfDocument::parse_with_password(data, b"user").unwrap();
+    let perms = doc
+        .permissions()
+        .expect("encrypted doc must have permissions");
+    // P = -3904: all permission bits clear.
+    assert!(!perms.can_modify, "modify should be denied");
+    assert!(!perms.can_annotate, "annotate should be denied");
+    assert!(!perms.can_copy_text, "copy_text should be denied");
+    assert!(!perms.can_fill_forms, "fill_forms should be denied");
+    assert!(!perms.can_assemble, "assemble should be denied");
+    assert!(!perms.can_print, "print should be denied");
+}
+
+#[cfg(feature = "crypto")]
+#[test]
+fn aes256_encrypted_pdf_permissions_parsed() {
+    // encrypted_aes256.pdf was generated with P_FLAGS = -3904 (all deny).
+    let data = include_bytes!("fixtures/encrypted_aes256.pdf").to_vec();
+    let doc = PdfDocument::parse_with_password(data, b"test").unwrap();
+    let perms = doc
+        .permissions()
+        .expect("encrypted doc must have permissions");
+    assert!(!perms.can_modify);
+    assert!(!perms.can_annotate);
+    assert!(!perms.can_copy_text);
+    assert!(!perms.can_fill_forms);
 }
 
 // ---------------------------------------------------------------------------

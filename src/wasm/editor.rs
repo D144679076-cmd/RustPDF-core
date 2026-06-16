@@ -193,6 +193,8 @@ impl WasmEditor {
     ///
     /// Returns the bytes of the new PDF. Requires a Pro license.
     pub fn extract_pages(&self, start: usize, end: usize) -> Result<Vec<u8>, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_assemble, "assemble")?;
         crate::editor::extract_pages(self.original_bytes.clone(), start..end)
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -208,6 +210,8 @@ impl WasmEditor {
         width_pt: f64,
         height_pt: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_assemble, "assemble")?;
         log::debug!(
             "[pdf-core] add_blank_page index={} {}×{}",
             index,
@@ -220,6 +224,8 @@ impl WasmEditor {
 
     /// Delete the page at `index` (0-based).
     pub fn delete_page(&mut self, index: usize) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_assemble, "assemble")?;
         log::debug!("[pdf-core] delete_page index={}", index);
         crate::editor::delete_page(&mut self.editor, index)
             .map_err(|e| JsError::new(&e.to_string()))
@@ -227,6 +233,8 @@ impl WasmEditor {
 
     /// Move the page at `from_index` to `to_index` (both 0-based).
     pub fn move_page(&mut self, from_index: usize, to_index: usize) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_assemble, "assemble")?;
         log::debug!("[pdf-core] move_page from={} to={}", from_index, to_index);
         crate::editor::move_page(&mut self.editor, from_index, to_index)
             .map_err(|e| JsError::new(&e.to_string()))
@@ -457,6 +465,8 @@ impl WasmEditor {
         height: f64,
         contents: &str,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::Text {
                 contents: contents.to_string(),
@@ -486,6 +496,8 @@ impl WasmEditor {
         b: f64,
         align: u8,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let da = format!("/{} {} Tf {} {} {} rg", font_name, font_size, r, g, b);
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::FreeText {
@@ -511,6 +523,8 @@ impl WasmEditor {
         g: f64,
         b: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         if quad_points.len() < 8 {
             return Err(JsError::new("quad_points must have at least 8 values"));
         }
@@ -536,6 +550,8 @@ impl WasmEditor {
         g: f64,
         b: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         if quad_points.len() < 8 {
             return Err(JsError::new("quad_points must have at least 8 values"));
         }
@@ -562,6 +578,8 @@ impl WasmEditor {
         height: f64,
         uri: &str,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::Link {
                 uri: uri.to_string(),
@@ -582,6 +600,8 @@ impl WasmEditor {
         g: f64,
         b: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         if quad_points.len() < 8 {
             return Err(JsError::new("quad_points must have at least 8 values"));
         }
@@ -611,6 +631,8 @@ impl WasmEditor {
         g: f64,
         b: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::Redact {
                 overlay_color: [r, g, b],
@@ -655,6 +677,8 @@ impl WasmEditor {
         g: f64,
         b: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::Stamp {
                 name: name.to_string(),
@@ -683,6 +707,8 @@ impl WasmEditor {
         width: f64,
         height: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         let builder = crate::editor::AnnotationBuilder::new(
             crate::editor::AnnotationType::FileAttachment {
                 file_data: file_bytes.to_vec(),
@@ -723,6 +749,8 @@ impl WasmEditor {
         b: f64,
         line_width: f64,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_annotate, "annotate")?;
         if points.len() < 4 || !points.len().is_multiple_of(2) {
             return Err(JsError::new(
                 "points must be an even-length array with at least 4 values",
@@ -856,6 +884,8 @@ impl WasmEditor {
         subject: &str,
         keywords: &str,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_modify, "modify")?;
         let fields = crate::editor::MetadataFields {
             title: if title.is_empty() { None } else { Some(title) },
             author: if author.is_empty() {
@@ -925,6 +955,38 @@ impl WasmEditor {
         self.editor.doc.is_signed()
     }
 
+    /// Return the document's operation permissions as a JSON object.
+    ///
+    /// For unencrypted documents all permissions are `true`.
+    /// Keys: `can_print`, `can_modify`, `can_copy_text`, `can_annotate`,
+    /// `can_fill_forms`, `can_assemble`.
+    #[cfg(feature = "crypto")]
+    pub fn get_permissions(&self) -> String {
+        let perms = self
+            .editor
+            .doc
+            .permissions()
+            .unwrap_or(crate::crypto::handler::Permissions {
+                can_print: true,
+                can_modify: true,
+                can_copy_text: true,
+                can_annotate: true,
+                can_fill_forms: true,
+                can_extract_accessibility: true,
+                can_assemble: true,
+                can_print_high_quality: true,
+            });
+        format!(
+            r#"{{"can_print":{},"can_modify":{},"can_copy_text":{},"can_annotate":{},"can_fill_forms":{},"can_assemble":{}}}"#,
+            perms.can_print,
+            perms.can_modify,
+            perms.can_copy_text,
+            perms.can_annotate,
+            perms.can_fill_forms,
+            perms.can_assemble,
+        )
+    }
+
     /// Drop derived edit caches after an undo/redo so they rebuild from the
     /// restored writer state on next use.
     fn invalidate_edit_caches(&mut self) {
@@ -980,6 +1042,8 @@ impl WasmEditor {
     /// For checkboxes, `value` should be `"true"`, `"Yes"` (checked) or anything else (unchecked).
     /// For combo/list fields, `value` is the export value to select.
     pub fn set_field_value(&mut self, field_name: &str, value: &str) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_fill_forms, "fill_forms")?;
         let fields = crate::forms::read_form_fields(&self.editor.doc)
             .map_err(|e| JsError::new(&e.to_string()))?;
         let field = fields
@@ -1033,6 +1097,8 @@ impl WasmEditor {
     /// Fields not present in the FDF are left unchanged. Requires a Pro license
     /// (enforced per-field by the underlying `set_*` helpers).
     pub fn import_fdf(&mut self, fdf_bytes: &[u8]) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_fill_forms, "fill_forms")?;
         crate::forms::import_fdf(&mut self.editor, fdf_bytes)
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -1049,6 +1115,8 @@ impl WasmEditor {
     /// Fields not present in the XFDF are left unchanged. Requires a Pro
     /// license (enforced per-field by the underlying `set_*` helpers).
     pub fn import_xfdf(&mut self, xfdf_str: &str) -> Result<(), JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.editor.doc, |p| p.can_fill_forms, "fill_forms")?;
         crate::forms::import_xfdf(&mut self.editor, xfdf_str)
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -1114,6 +1182,24 @@ impl WasmEditor {
         );
         self.original_bytes = new_bytes.clone();
         Ok(js_sys::Uint8Array::from(new_bytes.as_slice()))
+    }
+
+    /// Optimize the current document and return the optimized PDF bytes.
+    ///
+    /// `options_json` is a JSON object with optional boolean/number fields:
+    /// `recompress_streams`, `deduplicate_resources`, `remove_unused_objects`,
+    /// `downsample_images`, `image_max_dpi`. Missing fields use the defaults.
+    /// Requires a Pro license.
+    #[cfg(feature = "crypto")]
+    pub fn optimize(&mut self, options_json: &str) -> Result<js_sys::Uint8Array, JsError> {
+        let options = parse_optimization_options(options_json);
+        let current_bytes = self
+            .editor
+            .save_append(&self.original_bytes)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        crate::writer::optimizer::optimize(&current_bytes, &options)
+            .map(|v| js_sys::Uint8Array::from(v.as_slice()))
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Render `page_index` from the editor's CURRENT (edited) state **without** a
@@ -1234,6 +1320,63 @@ fn sigs_to_json(results: &[crate::signatures::SignatureVerification]) -> String 
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Parse a JSON object into `OptimizationOptions`, using defaults for missing keys.
+#[cfg(feature = "crypto")]
+fn parse_optimization_options(json: &str) -> crate::writer::optimizer::OptimizationOptions {
+    use crate::writer::optimizer::OptimizationOptions;
+    let mut opts = OptimizationOptions::default();
+
+    if let Some(v) = json_opt_bool(json, "recompress_streams") {
+        opts.recompress_streams = v;
+    }
+    if let Some(v) = json_opt_bool(json, "deduplicate_resources") {
+        opts.deduplicate_resources = v;
+    }
+    if let Some(v) = json_opt_bool(json, "remove_unused_objects") {
+        opts.remove_unused_objects = v;
+    }
+    if let Some(v) = json_opt_bool(json, "downsample_images") {
+        opts.downsample_images = v;
+    }
+    if let Some(v) = json_opt_u32(json, "image_max_dpi") {
+        opts.image_max_dpi = v;
+    }
+    opts
+}
+
+/// Extract an optional boolean field from a flat JSON object string.
+#[cfg(feature = "crypto")]
+fn json_opt_bool(json: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{}\"", key);
+    let pos = json.find(&needle)?;
+    let rest = json[pos + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Extract an optional u32 field from a flat JSON object string.
+#[cfg(feature = "crypto")]
+fn json_opt_u32(json: &str, key: &str) -> Option<u32> {
+    let needle = format!("\"{}\"", key);
+    let pos = json.find(&needle)?;
+    let rest = json[pos + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
 
 fn frames_to_json(
     doc: &crate::parser::objects::PdfDocument,
@@ -1643,5 +1786,60 @@ impl WasmPdfWriter {
         let bytes = self.editor.save_append(&self.current_bytes)?;
         self.current_bytes = bytes.clone();
         Ok(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PDF/A compliance — validate and convert
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen]
+impl WasmEditor {
+    /// Validate the open document against a PDF/A conformance level.
+    ///
+    /// `level` must be one of `"1b"`, `"2b"`, or `"3b"`.
+    /// Returns a JSON array of violation objects:
+    /// `[{"rule":"6.2.3","description":"…","obj_id":null}, …]`
+    /// An empty array `[]` means the document is conformant.
+    pub fn validate_pdfa(&self, level: &str) -> Result<String, JsError> {
+        let violations = match level {
+            "1b" => crate::compliance::validate_pdfa_1b(&self.editor.doc),
+            "2b" => crate::compliance::validate_pdfa_2b(&self.editor.doc),
+            "3b" => crate::compliance::validate_pdfa_3b(&self.editor.doc),
+            _ => return Err(JsError::new("unknown PDF/A level; use '1b', '2b', or '3b'")),
+        }
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+        let items: Vec<String> = violations
+            .iter()
+            .map(|v| {
+                let desc = v.description.replace('\\', "\\\\").replace('"', "\\\"");
+                let obj_id = match v.obj_id {
+                    Some(id) => id.to_string(),
+                    None => "null".to_string(),
+                };
+                format!(
+                    r#"{{"rule":"{}","description":"{}","obj_id":{}}}"#,
+                    v.rule, desc, obj_id
+                )
+            })
+            .collect();
+
+        Ok(format!("[{}]", items.join(",")))
+    }
+
+    /// Convert the open document to a PDF/A conformance level in place.
+    ///
+    /// `level` must be one of `"1b"`, `"2b"`, or `"3b"`.
+    /// Call [`save`](WasmEditor::save) afterwards to get the updated bytes.
+    /// Requires an Enterprise license.
+    pub fn convert_to_pdfa(&mut self, level: &str) -> Result<(), JsError> {
+        match level {
+            "1b" => crate::compliance::convert_to_pdfa_1b(&mut self.editor),
+            "2b" => crate::compliance::convert_to_pdfa_2b(&mut self.editor),
+            "3b" => crate::compliance::convert_to_pdfa_3b(&mut self.editor),
+            _ => return Err(JsError::new("unknown PDF/A level; use '1b', '2b', or '3b'")),
+        }
+        .map_err(|e| JsError::new(&e.to_string()))
     }
 }

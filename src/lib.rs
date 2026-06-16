@@ -12,6 +12,7 @@
 //! - [`document`] — Document structure: catalog, pages, metadata, outlines.
 //! - [`error`] — Shared error types used across the crate.
 
+pub mod compliance;
 pub mod content;
 #[cfg(feature = "crypto")]
 pub mod crypto;

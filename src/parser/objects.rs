@@ -229,6 +229,8 @@ pub struct PdfDocument {
     page_refs: RwLock<Option<Vec<PdfObject>>>,
     #[cfg(feature = "crypto")]
     enc: Option<crate::crypto::EncryptionHandler>,
+    #[cfg(feature = "crypto")]
+    permissions: Option<crate::crypto::handler::Permissions>,
 }
 
 // `RwLock` is not `Clone` (unlike the `RefCell` it replaced), so we clone by
@@ -247,6 +249,8 @@ impl Clone for PdfDocument {
             page_refs: RwLock::new(self.page_refs.read().clone()),
             #[cfg(feature = "crypto")]
             enc: self.enc.clone(),
+            #[cfg(feature = "crypto")]
+            permissions: self.permissions,
         }
     }
 }
@@ -306,6 +310,21 @@ impl PdfDocument {
         let doc_id = extract_file_id(&trailer);
         let enc = crate::crypto::EncryptionHandler::from_trailer(&trailer, &doc_id, password)?;
 
+        // Read /P from the Encrypt dict to build the Permissions value.
+        let permissions = if enc.is_some() {
+            if let Some(PdfObject::Dictionary(d)) = trailer.get("Encrypt") {
+                if let Some(PdfObject::Integer(p)) = d.get("P") {
+                    Some(crate::crypto::handler::parse_permissions(*p as i32))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(PdfDocument {
             data,
             xref,
@@ -315,6 +334,7 @@ impl PdfDocument {
             overrides: RwLock::new(HashMap::new()),
             page_refs: RwLock::new(None),
             enc,
+            permissions,
         })
     }
 
@@ -324,6 +344,15 @@ impl PdfDocument {
     #[cfg(feature = "crypto")]
     pub fn encryption_handler(&self) -> Option<&crate::crypto::EncryptionHandler> {
         self.enc.as_ref()
+    }
+
+    /// The document's operation permissions, decoded from the `/P` entry in the
+    /// `/Encrypt` dictionary.
+    ///
+    /// Returns `None` for unencrypted documents (no restrictions apply).
+    #[cfg(feature = "crypto")]
+    pub fn permissions(&self) -> Option<crate::crypto::handler::Permissions> {
+        self.permissions
     }
 
     /// Whether the document declares encryption (`/Encrypt` in the trailer).

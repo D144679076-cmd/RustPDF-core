@@ -474,6 +474,7 @@ pub fn add_annotation(
     crate::license::require(crate::license::Tier::Pro, "add_annotation")?;
     let (page_id, mut page_dict) = editor.get_page_dict(page_index)?;
 
+    #[cfg(feature = "forms")]
     let rect = annot.rect;
 
     // Pre-process FileAttachment: build embedded file stream and Filespec dict

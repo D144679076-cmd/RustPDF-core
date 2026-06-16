@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use crate::content::graphics_state::{Color, FillRule, GraphicsState, Matrix, Path};
+use crate::content::graphics_state::{BlendMode, Color, FillRule, GraphicsState, Matrix, Path};
 use crate::content::interpreter::{ContentInterpreter, OutputDevice};
 use crate::content::operators::ContentStreamIter;
 use crate::content::text_state::TextSpan;
@@ -36,6 +36,56 @@ use super::image::{apply_smask, decode_image, decode_image_cached, scale_gray_ma
 use super::path_render::{build_skia_path, fill_path_with_rule, matrix_to_transform, stroke_path};
 use super::shading::Shading;
 use super::tile::TileRect;
+
+// ---------------------------------------------------------------------------
+// Soft mask types
+// ---------------------------------------------------------------------------
+
+/// Which channel of the rendered mask form determines per-pixel opacity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SoftMaskType {
+    /// Alpha channel of the mask form XObject image.
+    Alpha,
+    /// Luminosity of the mask form XObject image (0.2126R + 0.7152G + 0.0722B).
+    Luminosity,
+}
+
+/// A rendered soft mask ready to modulate drawing output.
+struct SoftMask {
+    /// Premultiplied RGBA pixels of the rendered mask form, canvas-local coordinates.
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    mask_type: SoftMaskType,
+}
+
+impl SoftMask {
+    /// Sample the mask value (0–255) at canvas-local pixel (cx, cy).
+    fn sample(&self, cx: i32, cy: i32) -> u8 {
+        if cx < 0 || cy < 0 || cx >= self.width as i32 || cy >= self.height as i32 {
+            return 0;
+        }
+        let idx = (cy as u32 * self.width + cx as u32) as usize * 4;
+        if idx + 3 >= self.data.len() {
+            return 0;
+        }
+        match self.mask_type {
+            SoftMaskType::Alpha => self.data[idx + 3],
+            SoftMaskType::Luminosity => {
+                let alpha = self.data[idx + 3];
+                if alpha == 0 {
+                    return 0;
+                }
+                // Un-premultiply to get straight RGB for luminosity calculation.
+                let a = alpha as f32 / 255.0;
+                let r = self.data[idx] as f32 / a;
+                let g = self.data[idx + 1] as f32 / a;
+                let b = self.data[idx + 2] as f32 / a;
+                (0.2126 * r + 0.7152 * g + 0.0722 * b).min(255.0) as u8
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PageRenderer
@@ -69,6 +119,9 @@ struct PageRenderer<'doc> {
     /// for pattern, font, and XObject lookup; falls back to `resources_raw`
     /// (page-level resources) when the stack is empty.
     resource_stack: Vec<Arc<PdfDict>>,
+    /// Active ExtGState soft mask (ISO 32000-1 §11.6.5.2).  Set by `set_soft_mask`,
+    /// cleared by `clear_soft_mask` or when `/SMask /None` appears in a `gs` operator.
+    current_soft_mask: Option<SoftMask>,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -89,6 +142,7 @@ impl<'doc> PageRenderer<'doc> {
             font_bytes_cache: FontBytesCache::new(),
             blit_scratch: Vec::new(),
             resource_stack: Vec::new(),
+            current_soft_mask: None,
         }
     }
 
@@ -110,6 +164,7 @@ impl<'doc> PageRenderer<'doc> {
             font_bytes_cache: FontBytesCache::new(),
             blit_scratch: Vec::new(),
             resource_stack: Vec::new(),
+            current_soft_mask: None,
         }
     }
 
@@ -133,6 +188,7 @@ impl<'doc> PageRenderer<'doc> {
             font_bytes_cache: cache.font_bytes,
             blit_scratch: Vec::new(),
             resource_stack: Vec::new(),
+            current_soft_mask: None,
         }
     }
 
@@ -156,6 +212,7 @@ impl<'doc> PageRenderer<'doc> {
             font_bytes_cache: FontBytesCache::new(),
             blit_scratch: Vec::new(),
             resource_stack: Vec::new(),
+            current_soft_mask: None,
         }
     }
 
@@ -165,6 +222,129 @@ impl<'doc> PageRenderer<'doc> {
     /// falls back to the page-level resources when no form is active.
     fn current_resources(&self) -> &Arc<PdfDict> {
         self.resource_stack.last().unwrap_or(&self.resources_raw)
+    }
+
+    /// Apply `self.current_soft_mask` to every pixel of `canvas` in-place.
+    ///
+    /// Each pixel's alpha is multiplied by the mask value at the same canvas-local
+    /// coordinates.  RGB channels are scaled by the same factor (premultiplied storage).
+    fn apply_canvas_soft_mask(mask: &SoftMask, canvas: &mut PixmapBuffer) {
+        let data = canvas.inner.data_mut();
+        let w = canvas.width;
+        let h = canvas.height;
+        for cy in 0..h {
+            for cx in 0..w {
+                let idx = (cy * w + cx) as usize * 4;
+                if idx + 3 >= data.len() {
+                    break;
+                }
+                let m = mask.sample(cx as i32, cy as i32) as u32;
+                data[idx] = ((data[idx] as u32 * m) / 255) as u8;
+                data[idx + 1] = ((data[idx + 1] as u32 * m) / 255) as u8;
+                data[idx + 2] = ((data[idx + 2] as u32 * m) / 255) as u8;
+                data[idx + 3] = ((data[idx + 3] as u32 * m) / 255) as u8;
+            }
+        }
+    }
+
+    /// Apply `mask` to `rgba` (straight/non-premultiplied RGBA, row-major) that
+    /// is about to be blitted at canvas-local position `(dst_x, dst_y)`.
+    ///
+    /// Pixels outside the mask bounds are made fully transparent.
+    fn apply_mask_to_image(
+        mask: &SoftMask,
+        rgba: &mut Vec<u8>,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+    ) {
+        for py in 0..dst_h {
+            for px in 0..dst_w {
+                let cx = dst_x + px as i32;
+                let cy = dst_y + py as i32;
+                let m = mask.sample(cx, cy) as u32;
+                let idx = (py * dst_w + px) as usize * 4;
+                if idx + 3 >= rgba.len() {
+                    break;
+                }
+                rgba[idx + 3] = ((rgba[idx + 3] as u32 * m) / 255) as u8;
+            }
+        }
+    }
+
+    /// Render the soft mask form XObject `form_stream` into a canvas-sized pixmap
+    /// and store it as the active soft mask.
+    fn render_soft_mask(&mut self, mask_type: SoftMaskType, form_stream: &PdfStream, ctm: &Matrix) {
+        let w = self.canvas.width;
+        let h = self.canvas.height;
+        let origin = self.canvas.origin;
+
+        let mask_canvas = match PixmapBuffer::new_transparent(w, h, origin) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[smask] alloc failed: {}", e);
+                return;
+            }
+        };
+
+        // Use the form's own Resources if available, else fall back to page resources.
+        let form_resources = match form_stream.dict.get("Resources") {
+            Some(PdfObject::Dictionary(d)) => Arc::new(d.clone()),
+            Some(obj) => match self.doc.resolve(obj) {
+                Ok(PdfObject::Dictionary(d)) => Arc::new(d),
+                _ => Arc::clone(&self.resources_raw),
+            },
+            None => Arc::clone(&self.resources_raw),
+        };
+
+        let res_for_interp = Arc::clone(&form_resources);
+        let doc = self.doc;
+
+        let mut sub_renderer = PageRenderer {
+            canvas: mask_canvas,
+            glyph_cache: GlyphCache::new(),
+            scale: self.scale,
+            doc,
+            resources_raw: form_resources,
+            font_resolver: Box::new(EmbeddedFontResolver),
+            transparency_stack: Vec::new(),
+            font_bytes_cache: FontBytesCache::new(),
+            blit_scratch: Vec::new(),
+            resource_stack: Vec::new(),
+            current_soft_mask: None,
+        };
+
+        let mut interp = ContentInterpreter::new();
+        interp.gfx.current.ctm = *ctm;
+
+        match form_stream.decode_with_doc(doc) {
+            Ok(content) => {
+                let iter = ContentStreamIter::new(&content);
+                if let Err(e) = interp.interpret_iter(
+                    iter,
+                    &mut sub_renderer,
+                    Some(doc),
+                    Some(&*res_for_interp),
+                ) {
+                    log::warn!("[smask] form render error: {}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("[smask] form decode error: {}", e);
+                return;
+            }
+        }
+
+        let mask_data = sub_renderer.canvas.data().to_vec();
+        self.current_soft_mask = Some(SoftMask {
+            data: mask_data,
+            width: w,
+            height: h,
+            mask_type,
+        });
+        log::debug!("[smask] rendered {:?} mask {}×{}", mask_type, w, h);
     }
 }
 
@@ -178,7 +358,22 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
         //           state.stroke_alpha, self.scale, dbb.0, dbb.1, dbb.2, dbb.3,
         //           state.clip_path.len());
         //   }
-        stroke_path(path, state, &state.ctm, &mut self.canvas);
+        if self.current_soft_mask.is_some() {
+            let w = self.canvas.width;
+            let h = self.canvas.height;
+            let origin = self.canvas.origin;
+            if let Ok(mut temp) = PixmapBuffer::new_transparent(w, h, origin) {
+                stroke_path(path, state, &state.ctm, &mut temp);
+                if let Some(ref mask) = self.current_soft_mask {
+                    Self::apply_canvas_soft_mask(mask, &mut temp);
+                }
+                self.canvas.composite_over(&temp, 1.0, BlendMode::Normal);
+            } else {
+                stroke_path(path, state, &state.ctm, &mut self.canvas);
+            }
+        } else {
+            stroke_path(path, state, &state.ctm, &mut self.canvas);
+        }
     }
 
     fn fill_path(&mut self, path: &Path, state: &GraphicsState, rule: FillRule) {
@@ -194,12 +389,32 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
             self.fill_path_with_pattern(path, state, rule, name.clone(), tint.clone());
             return;
         }
-        fill_path_with_rule(path, state, rule, &state.ctm, &mut self.canvas);
+        if self.current_soft_mask.is_some() {
+            let w = self.canvas.width;
+            let h = self.canvas.height;
+            let origin = self.canvas.origin;
+            if let Ok(mut temp) = PixmapBuffer::new_transparent(w, h, origin) {
+                fill_path_with_rule(path, state, rule, &state.ctm, &mut temp);
+                if let Some(ref mask) = self.current_soft_mask {
+                    Self::apply_canvas_soft_mask(mask, &mut temp);
+                }
+                self.canvas.composite_over(&temp, 1.0, BlendMode::Normal);
+            } else {
+                fill_path_with_rule(path, state, rule, &state.ctm, &mut self.canvas);
+            }
+        } else {
+            fill_path_with_rule(path, state, rule, &state.ctm, &mut self.canvas);
+        }
     }
 
     fn draw_text_span(&mut self, span: &TextSpan, state: &GraphicsState) {
         if span.text.is_empty() {
             return;
+        }
+        // Soft mask on text is not yet composited through a temp canvas (Phase 3).
+        // Text appears unmasked, which is incorrect but better than invisible.
+        if self.current_soft_mask.is_some() {
+            log::debug!("[smask] soft mask ignored for text span (Phase 3 follow-up)");
         }
         // span.x, span.y are already in tile-local pixel space because the
         // initial CTM (with Y-flip and tile offset) was applied to the interpreter
@@ -667,12 +882,25 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
         // mapped through the CTM — handles rotation and shear correctly.
         let (dst_x, dst_y, dst_w, dst_h) = ctm_to_dst_rect(&state.ctm);
 
-        if dst_w > 0 && dst_h > 0 && dst_w == iw && dst_h == ih {
-            self.canvas.blit_rgba(dst_x, dst_y, data, iw, ih);
-        } else if iw > 0 && ih > 0 {
-            let scaled = scale_rgba_bilinear(data, iw, ih, dst_w.max(1), dst_h.max(1));
+        // Scale to destination size first, then apply any active ExtGState soft mask.
+        let final_data: Vec<u8>;
+        let (blit_w, blit_h, blit_data): (u32, u32, &[u8]) =
+            if dst_w > 0 && dst_h > 0 && dst_w == iw && dst_h == ih {
+                (iw, ih, data)
+            } else if iw > 0 && ih > 0 {
+                final_data = scale_rgba_bilinear(data, iw, ih, dst_w.max(1), dst_h.max(1));
+                (dst_w.max(1), dst_h.max(1), &final_data)
+            } else {
+                return;
+            };
+
+        if let Some(ref mask) = self.current_soft_mask {
+            let mut buf = blit_data.to_vec();
+            Self::apply_mask_to_image(mask, &mut buf, dst_x, dst_y, blit_w, blit_h);
+            self.canvas.blit_rgba(dst_x, dst_y, &buf, blit_w, blit_h);
+        } else {
             self.canvas
-                .blit_rgba(dst_x, dst_y, &scaled, dst_w.max(1), dst_h.max(1));
+                .blit_rgba(dst_x, dst_y, blit_data, blit_w, blit_h);
         }
     }
 
@@ -723,6 +951,24 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
 
     fn exit_form_resources(&mut self) {
         self.resource_stack.pop();
+    }
+
+    fn set_soft_mask(
+        &mut self,
+        mask_type: &str,
+        form_stream: &crate::parser::objects::PdfStream,
+        ctm: &Matrix,
+    ) {
+        let mt = if mask_type == "Alpha" {
+            SoftMaskType::Alpha
+        } else {
+            SoftMaskType::Luminosity
+        };
+        self.render_soft_mask(mt, form_stream, ctm);
+    }
+
+    fn clear_soft_mask(&mut self) {
+        self.current_soft_mask = None;
     }
 }
 

@@ -1,6 +1,6 @@
 # Phase 2 — PDF/A Compliance (1b, 2b, 3b)
 
-**Status:** Not started
+**Status:** Complete — 2026-06-16
 **Effort:** ~2–3 months
 **Tier gate:** Enterprise
 

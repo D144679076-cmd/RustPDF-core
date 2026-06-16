@@ -1,6 +1,6 @@
 # Phase 2 — Soft Masks
 
-**Status:** Not started
+**Status:** Complete — 2026-06-16
 **Effort:** ~3 weeks
 **Scope:** Renderer only — no public API change needed
 

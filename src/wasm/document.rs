@@ -47,6 +47,37 @@ impl WasmDocument {
 
     /// Returns document metadata as a JSON string.
     ///
+    /// Return the document's operation permissions as a JSON object.
+    ///
+    /// For unencrypted documents all permissions are `true` (no restrictions).
+    /// Keys: `can_print`, `can_modify`, `can_copy_text`, `can_annotate`,
+    /// `can_fill_forms`, `can_assemble`.
+    #[cfg(feature = "crypto")]
+    pub fn get_permissions(&self) -> String {
+        let perms = self
+            .doc
+            .permissions()
+            .unwrap_or(crate::crypto::handler::Permissions {
+                can_print: true,
+                can_modify: true,
+                can_copy_text: true,
+                can_annotate: true,
+                can_fill_forms: true,
+                can_extract_accessibility: true,
+                can_assemble: true,
+                can_print_high_quality: true,
+            });
+        format!(
+            r#"{{"can_print":{},"can_modify":{},"can_copy_text":{},"can_annotate":{},"can_fill_forms":{},"can_assemble":{}}}"#,
+            perms.can_print,
+            perms.can_modify,
+            perms.can_copy_text,
+            perms.can_annotate,
+            perms.can_fill_forms,
+            perms.can_assemble,
+        )
+    }
+
     /// Keys: `title`, `author`, `subject`, `keywords`, `creator`, `producer`.
     pub fn get_metadata(&self) -> String {
         match crate::document::metadata::Metadata::from_document(&self.doc) {
@@ -270,6 +301,8 @@ impl WasmDocument {
     /// Coordinates are in PDF user-space (origin bottom-left).
     /// Set `case_sensitive` to `false` for case-insensitive matching.
     pub fn search_text(&self, query: &str, case_sensitive: bool) -> Result<String, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.doc, |p| p.can_copy_text, "copy_text")?;
         let results = crate::text::search_document(&self.doc, query, case_sensitive)
             .map_err(|e| JsError::new(&e.to_string()))?;
         let mut json = String::from("[");
@@ -293,6 +326,8 @@ impl WasmDocument {
 
     /// Extracts plain text from a page (0-based index).
     pub fn extract_text(&self, page_index: usize) -> Result<String, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.doc, |p| p.can_copy_text, "copy_text")?;
         use crate::document::catalog::Catalog;
         use crate::document::page::Page;
         use crate::text::TextExtractor;

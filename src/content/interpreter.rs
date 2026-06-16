@@ -85,6 +85,22 @@ pub trait OutputDevice {
         _state: &GraphicsState,
     ) {
     }
+
+    /// Called when an ExtGState activates a soft mask (ISO 32000-1 §11.6.5.2).
+    ///
+    /// `mask_type` is `"Alpha"` or `"Luminosity"`. `ctm` is the current
+    /// transformation matrix when the `gs` operator was processed — the renderer
+    /// uses it to render the mask form in the same coordinate space as the page.
+    fn set_soft_mask(
+        &mut self,
+        _mask_type: &str,
+        _form_stream: &crate::parser::objects::PdfStream,
+        _ctm: &Matrix,
+    ) {
+    }
+
+    /// Called when the soft mask is cleared (`/SMask /None` in ExtGState).
+    fn clear_soft_mask(&mut self) {}
 }
 
 /// The content stream interpreter.
@@ -229,7 +245,8 @@ impl ContentInterpreter {
                 if let (Some(PdfObject::Name(name)), Some(doc_ref), Some(res)) =
                     (operands.first(), doc, resources)
                 {
-                    self.apply_ext_gstate(name, doc_ref, res)?;
+                    let ctm = self.gfx.current.ctm;
+                    self.apply_ext_gstate(name, doc_ref, res, device, ctm)?;
                 }
             }
 
@@ -761,6 +778,8 @@ impl ContentInterpreter {
         name: &str,
         doc: &PdfDocument,
         resources: &crate::parser::objects::PdfDict,
+        device: &mut dyn OutputDevice,
+        ctm: Matrix,
     ) -> Result<()> {
         let ext_gstate_dict = match resources.get("ExtGState") {
             Some(PdfObject::Dictionary(d)) => d,
@@ -806,18 +825,35 @@ impl ContentInterpreter {
 
         if let Some(smask_val) = gs_dict.get("SMask") {
             match smask_val {
-                PdfObject::Name(n) if n == "None" => {}
+                PdfObject::Name(n) if n == "None" => {
+                    device.clear_soft_mask();
+                }
                 PdfObject::Name(_) => {
-                    // Named SMask other than "None" — no standard names exist; treat as no-op.
+                    // Named SMask other than "None" — no standard names; treat as no-op.
                 }
                 _ => {
-                    // Dict-valued SMask (Form XObject soft mask) is not yet implemented.
-                    // Treat as no-op: leave alpha unchanged so chart content remains visible.
-                    // Zeroing alpha (previous behaviour) was worse: it erased all fills.
-                    log::warn!(
-                        "[gs] /SMask in ExtGState '{}' — ignored (full SMask not yet implemented)",
-                        name
-                    );
+                    // Resolve to a dict (SMask specification dict per ISO 32000-1 §11.6.5.2).
+                    match doc.resolve(smask_val) {
+                        Ok(PdfObject::Dictionary(smask_dict)) => {
+                            let s_type = smask_dict
+                                .get("S")
+                                .and_then(|o| o.as_name())
+                                .unwrap_or("Luminosity");
+                            if let Some(g_ref) = smask_dict.get("G") {
+                                match doc.resolve(g_ref) {
+                                    Ok(PdfObject::Stream(form_stream)) => {
+                                        device.set_soft_mask(s_type, &form_stream, &ctm);
+                                    }
+                                    Ok(_) => log::warn!("[gs] SMask /G is not a stream"),
+                                    Err(e) => log::warn!("[gs] SMask /G resolve failed: {}", e),
+                                }
+                            } else {
+                                log::warn!("[gs] SMask dict has no /G key in '{}'", name);
+                            }
+                        }
+                        Ok(_) => log::warn!("[gs] SMask is not a dict in '{}'", name),
+                        Err(e) => log::warn!("[gs] SMask resolve failed in '{}': {}", name, e),
+                    }
                 }
             }
         }

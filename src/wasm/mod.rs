@@ -116,6 +116,27 @@ pub fn is_pdf_encrypted(bytes: &[u8]) -> Result<bool, JsError> {
 // Internal helpers (shared across submodules)
 // ---------------------------------------------------------------------------
 
+/// Check that the document permits `feature` (identified by the `permission` selector).
+///
+/// Returns `Ok(())` for unencrypted documents (no `/Encrypt` → no restrictions).
+/// Returns `Err(JsError)` when the document's `/P` flags deny the operation.
+#[cfg(feature = "crypto")]
+pub(crate) fn check_permission(
+    doc: &crate::parser::objects::PdfDocument,
+    permission: fn(&crate::crypto::handler::Permissions) -> bool,
+    feature: &str,
+) -> Result<(), wasm_bindgen::JsError> {
+    if let Some(perms) = doc.permissions() {
+        if !permission(&perms) {
+            return Err(wasm_bindgen::JsError::new(&format!(
+                "Document permissions deny '{}'",
+                feature
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn bbox_from_quad_points(qp: &[f64]) -> [f64; 4] {
     let xs: Vec<f64> = qp.iter().step_by(2).copied().collect();
     let ys: Vec<f64> = qp.iter().skip(1).step_by(2).copied().collect();

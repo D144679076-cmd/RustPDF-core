@@ -29,6 +29,44 @@ pub enum EncryptAlgorithm {
     Aes256,
 }
 
+/// PDF document operation permissions encoded in the `/P` integer (ISO 32000-1 §7.6.3.3 Table 22).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Permissions {
+    /// Bit 3 (value 4): print at any quality level.
+    pub can_print: bool,
+    /// Bit 4 (value 8): modify document content other than annotations, forms, or signatures.
+    pub can_modify: bool,
+    /// Bit 5 (value 16): copy or extract text and graphics.
+    pub can_copy_text: bool,
+    /// Bit 6 (value 32): add or modify annotations, including form fields.
+    pub can_annotate: bool,
+    /// Bit 9 (value 256): fill in existing interactive form fields.
+    pub can_fill_forms: bool,
+    /// Bit 10 (value 512): extract text/graphics for accessibility purposes.
+    pub can_extract_accessibility: bool,
+    /// Bit 11 (value 1024): assemble the document (insert/rotate/delete pages, bookmarks, thumbnails).
+    pub can_assemble: bool,
+    /// Bit 12 (value 2048): print in high quality (faithful digital copy).
+    pub can_print_high_quality: bool,
+}
+
+/// Decode the `/P` integer from the `/Encrypt` dictionary into a [`Permissions`] value.
+///
+/// Bits are numbered from 1 per ISO 32000-1 §7.6.3.3; bits 1–2 are reserved and
+/// always 0, so the lowest meaningful bit is bit 3 (value 4).
+pub fn parse_permissions(p: i32) -> Permissions {
+    Permissions {
+        can_print: p & 4 != 0,
+        can_modify: p & 8 != 0,
+        can_copy_text: p & 16 != 0,
+        can_annotate: p & 32 != 0,
+        can_fill_forms: p & 256 != 0,
+        can_extract_accessibility: p & 512 != 0,
+        can_assemble: p & 1024 != 0,
+        can_print_high_quality: p & 2048 != 0,
+    }
+}
+
 /// PDF Standard Security Handler — holds the derived file encryption key.
 #[derive(Debug, Clone)]
 pub struct EncryptionHandler {
@@ -638,5 +676,72 @@ mod tests {
         assert_ne!(buf, plaintext);
         handler.decrypt_string(3, 0, &mut buf).unwrap();
         assert_eq!(buf, plaintext);
+    }
+
+    // ── parse_permissions ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_permissions_deny_all() {
+        // P = 0: all permission bits clear.
+        let p = parse_permissions(0);
+        assert!(!p.can_print);
+        assert!(!p.can_modify);
+        assert!(!p.can_copy_text);
+        assert!(!p.can_annotate);
+        assert!(!p.can_fill_forms);
+        assert!(!p.can_extract_accessibility);
+        assert!(!p.can_assemble);
+        assert!(!p.can_print_high_quality);
+    }
+
+    #[test]
+    fn parse_permissions_allow_all() {
+        // P = -1 (0xFFFFFFFF): all bits set.
+        let p = parse_permissions(-1);
+        assert!(p.can_print);
+        assert!(p.can_modify);
+        assert!(p.can_copy_text);
+        assert!(p.can_annotate);
+        assert!(p.can_fill_forms);
+        assert!(p.can_extract_accessibility);
+        assert!(p.can_assemble);
+        assert!(p.can_print_high_quality);
+    }
+
+    #[test]
+    fn parse_permissions_print_only() {
+        // Bit 3 (value 4) set, all else clear.
+        let p = parse_permissions(4);
+        assert!(p.can_print);
+        assert!(!p.can_modify);
+        assert!(!p.can_copy_text);
+        assert!(!p.can_annotate);
+    }
+
+    #[test]
+    fn parse_permissions_p_minus_3904() {
+        // P = -3904 (0xFFFFF0C0): all permission bits (3-12) are clear.
+        // Used by qpdf and the gen_aes256_fixture.py script.
+        let p = parse_permissions(-3904);
+        assert!(!p.can_print);
+        assert!(!p.can_modify);
+        assert!(!p.can_copy_text);
+        assert!(!p.can_annotate);
+        assert!(!p.can_fill_forms);
+        assert!(!p.can_extract_accessibility);
+        assert!(!p.can_assemble);
+        assert!(!p.can_print_high_quality);
+    }
+
+    #[test]
+    fn parse_permissions_individual_bits() {
+        assert!(parse_permissions(4).can_print);
+        assert!(parse_permissions(8).can_modify);
+        assert!(parse_permissions(16).can_copy_text);
+        assert!(parse_permissions(32).can_annotate);
+        assert!(parse_permissions(256).can_fill_forms);
+        assert!(parse_permissions(512).can_extract_accessibility);
+        assert!(parse_permissions(1024).can_assemble);
+        assert!(parse_permissions(2048).can_print_high_quality);
     }
 }

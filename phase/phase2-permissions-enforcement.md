@@ -1,6 +1,6 @@
 # Phase 2 — Document Permissions Enforcement
 
-**Status:** Not started
+**Status:** Complete — 2026-06-16
 **Effort:** ~2 weeks
 
 ## Context
