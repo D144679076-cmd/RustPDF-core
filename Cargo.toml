@@ -38,6 +38,19 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 console_log = { version = "1", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+rquickjs = { version = "0.6", optional = true, features = ["bindgen", "classes", "properties"] }
+# Pure-Rust, WASM-compatible regex engine. Used by the Pro-tier regex search feature.
+regex = { version = "1", optional = true, default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+# REST API server (Enterprise feature, native only).
+axum = { version = "0.7", optional = true, features = ["multipart"] }
+tokio = { version = "1", optional = true, features = ["full"] }
+tower-http = { version = "0.5", optional = true, features = ["cors", "limit"] }
+serde_json = { version = "1", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+# PNG encoding for the /render endpoint (RGBA → PNG via pure-Rust encoder).
+png = { version = "0.17", optional = true }
+# Logger for the pdf-server binary.
+env_logger = { version = "0.11", optional = true }
 
 [features]
 crypto = ["dep:md-5", "dep:sha2", "dep:aes", "dep:cbc", "dep:hmac", "dep:base64", "dep:getrandom"]
@@ -45,12 +58,18 @@ render = ["dep:tiny-skia", "dep:fontdue", "dep:zune-jpeg"]
 writer = []
 forms  = ["writer"]
 signatures = ["dep:rsa", "dep:x509-cert", "crypto", "writer"]
+js-actions = ["dep:rquickjs"]
+search = ["dep:regex"]
 # WASM bridge: exposes #[wasm_bindgen] types for JS integration.
-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto", "js-actions", "search"]
 # WASM bridge with page rendering included (adds ~800 KB to the WASM binary).
 wasm-render = ["wasm", "render"]
 # Viewer-only WASM build: parse, render, text extract. No editor, writer, forms, or crypto.
 wasm-viewer = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "render"]
+# REST API server — Enterprise tier, native only.
+# render is NOT listed here because it requires the core-fonts directory at
+# build time (include_bytes!). Enable it separately with --features server,render.
+server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:serde_json", "dep:serde", "dep:png", "dep:env_logger", "writer", "forms", "crypto", "search"]
 
 [[bin]]
 name = "pdf-inspect"
@@ -61,10 +80,18 @@ name = "keygen"
 path = "src/bin/keygen.rs"
 required-features = ["crypto"]
 
+[[bin]]
+name = "pdf-server"
+path = "src/bin/pdf_server.rs"
+required-features = ["server"]
+
 [dev-dependencies]
 pretty_assertions = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+axum-test = "14"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }
 
 [[bench]]
 name = "render_bench"

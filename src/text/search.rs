@@ -151,6 +151,118 @@ pub fn search_page(
 }
 
 // ---------------------------------------------------------------------------
+// Regex search (Pro tier, requires `search` feature)
+// ---------------------------------------------------------------------------
+
+/// Search every page of `doc` for matches of the regex `pattern`.
+///
+/// Returns one [`SearchResult`] per match in page order. Requires the `search`
+/// feature and a Pro-tier license. Returns an error when `pattern` is not a
+/// valid regex.
+#[cfg(feature = "search")]
+pub fn search_document_regex(
+    doc: &PdfDocument,
+    pattern: &str,
+    case_sensitive: bool,
+) -> crate::error::Result<Vec<SearchResult>> {
+    #[cfg(feature = "crypto")]
+    crate::license::require(crate::license::Tier::Pro, "regex_search")?;
+    use regex::RegexBuilder;
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| {
+            crate::error::PdfError::invalid_structure(Box::leak(
+                format!("invalid regex: {e}").into_boxed_str(),
+            ))
+        })?;
+    let catalog = Catalog::from_document(doc)?;
+    let page_count = catalog.page_count;
+    let mut results = Vec::new();
+    for i in 0..page_count {
+        results.extend(search_page_regex_inner(doc, i, &re)?);
+    }
+    Ok(results)
+}
+
+/// Search a single page (0-based `page_index`) for matches of the regex `pattern`.
+///
+/// Requires the `search` feature and a Pro-tier license. Returns an error when
+/// `pattern` is not a valid regex.
+#[cfg(feature = "search")]
+pub fn search_page_regex(
+    doc: &PdfDocument,
+    page_index: usize,
+    pattern: &str,
+    case_sensitive: bool,
+) -> crate::error::Result<Vec<SearchResult>> {
+    #[cfg(feature = "crypto")]
+    crate::license::require(crate::license::Tier::Pro, "regex_search")?;
+    use regex::RegexBuilder;
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| {
+            crate::error::PdfError::invalid_structure(Box::leak(
+                format!("invalid regex: {e}").into_boxed_str(),
+            ))
+        })?;
+    search_page_regex_inner(doc, page_index, &re)
+}
+
+#[cfg(feature = "search")]
+fn search_page_regex_inner(
+    doc: &PdfDocument,
+    page_index: usize,
+    re: &regex::Regex,
+) -> crate::error::Result<Vec<SearchResult>> {
+    let catalog = Catalog::from_document(doc)?;
+    let page_dict = catalog.get_page_dict(doc, page_index)?;
+    let page = Page::from_dict(doc, &page_dict)?;
+    let extractor = TextExtractor::extract_from_page(doc, &page)?;
+    let words = extractor.words();
+
+    let mut full_text = String::new();
+    let mut word_char_starts: Vec<usize> = Vec::with_capacity(words.len());
+    for word in &words {
+        word_char_starts.push(full_text.len());
+        full_text.push_str(&word.text);
+        full_text.push(' ');
+    }
+
+    let mut results = Vec::new();
+    for m in re.find_iter(&full_text) {
+        let abs_pos = m.start();
+        let match_end = m.end();
+        let mut x1 = f64::MAX;
+        let mut y1 = f64::MAX;
+        let mut x2 = f64::MIN;
+        let mut y2 = f64::MIN;
+        let mut matched_text = String::new();
+
+        for (i, word) in words.iter().enumerate() {
+            let wstart = word_char_starts[i];
+            let wend = wstart + word.text.len();
+            if wend > abs_pos && wstart < match_end {
+                x1 = x1.min(word.x);
+                y1 = y1.min(word.y);
+                x2 = x2.max(word.x + word.width);
+                y2 = y2.max(word.y + word.font_size);
+                matched_text.push_str(&word.text);
+            }
+        }
+        if x1 < f64::MAX {
+            results.push(SearchResult {
+                page_index,
+                text: matched_text,
+                bounds: [x1, y1, x2, y2],
+            });
+        }
+    }
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -200,6 +312,33 @@ mod tests {
         let doc = PdfDocument::parse(data).unwrap();
         let results = search_document(&doc, "", true).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn regex_finds_pattern() {
+        let data = include_bytes!("../../tests/fixtures/multipage.pdf").to_vec();
+        let doc = PdfDocument::parse(data).unwrap();
+        let results = super::search_document_regex(&doc, r"Page\s+\d+", true).unwrap();
+        assert_eq!(results.len(), 3, "expected 'Page N' on each of the 3 pages");
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn regex_case_insensitive() {
+        let data = include_bytes!("../../tests/fixtures/multipage.pdf").to_vec();
+        let doc = PdfDocument::parse(data).unwrap();
+        let results = super::search_document_regex(&doc, r"page\s+\d+", false).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn invalid_regex_returns_error() {
+        let data = include_bytes!("../../tests/fixtures/minimal.pdf").to_vec();
+        let doc = PdfDocument::parse(data).unwrap();
+        let result = super::search_document_regex(&doc, r"[invalid", true);
+        assert!(result.is_err());
     }
 
     #[test]

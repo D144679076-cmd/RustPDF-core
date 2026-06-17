@@ -14,3 +14,5 @@ pub mod search;
 pub use extractor::TextExtractor;
 pub use layout::{TextBlock, TextLine, TextWord};
 pub use search::{search_document, search_page, SearchResult};
+#[cfg(feature = "search")]
+pub use search::{search_document_regex, search_page_regex};

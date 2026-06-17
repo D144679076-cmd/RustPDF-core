@@ -19,5 +19,7 @@ pub use appearance::{
     text_note_appearance,
 };
 pub use fdf::{export_fdf, export_xfdf, import_fdf, import_xfdf};
-pub use filler::{set_checkbox, set_combo_or_list, set_text_field};
+pub use filler::{
+    flatten_all_form_fields, flatten_form_fields, set_checkbox, set_combo_or_list, set_text_field,
+};
 pub use reader::{read_form_fields, FieldType, FormField};

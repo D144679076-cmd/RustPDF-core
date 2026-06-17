@@ -324,6 +324,40 @@ impl WasmDocument {
         Ok(json)
     }
 
+    /// Search all pages for matches of the regex `pattern`.
+    ///
+    /// Returns a JSON array identical in shape to [`search_text`]: each element
+    /// has `page_index`, `text`, and `bounds`. Requires a Pro-tier license.
+    /// Returns an error when `pattern` is an invalid regex.
+    #[cfg(feature = "search")]
+    pub fn search_text_regex(
+        &self,
+        pattern: &str,
+        case_sensitive: bool,
+    ) -> Result<String, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.doc, |p| p.can_copy_text, "copy_text")?;
+        let results = crate::text::search_document_regex(&self.doc, pattern, case_sensitive)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let mut json = String::from("[");
+        for (i, r) in results.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                r#"{{"page_index":{},"text":{},"bounds":[{},{},{},{}]}}"#,
+                r.page_index,
+                super::json_str(&r.text),
+                r.bounds[0],
+                r.bounds[1],
+                r.bounds[2],
+                r.bounds[3],
+            ));
+        }
+        json.push(']');
+        Ok(json)
+    }
+
     /// Extracts plain text from a page (0-based index).
     pub fn extract_text(&self, page_index: usize) -> Result<String, JsError> {
         #[cfg(feature = "crypto")]

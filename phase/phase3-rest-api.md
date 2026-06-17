@@ -1,6 +1,6 @@
 # Phase 3 — REST Server API
 
-**Status:** Not started
+**Status:** Complete — 2026-06-17
 **Effort:** ~2–3 months
 **Tier gate:** Enterprise (server-side license validation)
 **Platform:** Native only (`#[cfg(not(target_arch = "wasm32"))]`)

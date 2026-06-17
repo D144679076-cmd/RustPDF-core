@@ -54,6 +54,11 @@ pub struct WasmEditor {
     /// `decoded_stream_cache` entry, we re-insert the raw bytes here so the
     /// renderer never has to re-inflate the committed content stream.
     pub(crate) committed_bytes: std::collections::HashMap<u32, Vec<u8>>,
+    /// Optional QuickJS engine for PDF JavaScript action execution.
+    ///
+    /// Populated lazily by [`WasmEditor::enable_javascript`].
+    #[cfg(feature = "js-actions")]
+    js_engine: Option<crate::js::JsEngine>,
     /// Whether the trial watermark has already been applied to the writer pool.
     /// The watermark is appended once; subsequent `save()` calls must NOT re-apply
     /// it (doing so multiplied watermark streams across every page on every save,
@@ -100,6 +105,8 @@ impl WasmEditor {
             watermarked: false,
             pending_decorations: None,
             committed_style_runs: std::collections::HashMap::new(),
+            #[cfg(feature = "js-actions")]
+            js_engine: None,
         })
     }
 
@@ -136,6 +143,8 @@ impl WasmEditor {
             watermarked: false,
             pending_decorations: None,
             committed_style_runs: std::collections::HashMap::new(),
+            #[cfg(feature = "js-actions")]
+            js_engine: None,
         })
     }
 
@@ -1119,6 +1128,120 @@ impl WasmEditor {
         super::check_permission(&self.editor.doc, |p| p.can_fill_forms, "fill_forms")?;
         crate::forms::import_xfdf(&mut self.editor, xfdf_str)
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── Form flattening ───────────────────────────────────────────────────────
+
+    /// Flatten all interactive form fields on a single page into static content.
+    ///
+    /// Widget annotations are removed and their visual appearance is burned into
+    /// the page content stream.  Requires a Pro license.
+    pub fn flatten_form_fields(&mut self, page_index: usize) -> Result<(), JsError> {
+        crate::forms::flatten_form_fields(&mut self.editor, page_index)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Flatten all interactive form fields across every page.
+    ///
+    /// After this call the document contains no Widget annotations.
+    /// Requires a Pro license.
+    pub fn flatten_all_form_fields(&mut self) -> Result<(), JsError> {
+        crate::forms::flatten_all_form_fields(&mut self.editor)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    // ── JavaScript actions ────────────────────────────────────────────────────
+
+    /// Enable PDF JavaScript action execution for this document.
+    ///
+    /// Initialises the embedded QuickJS runtime (gated on the `js-actions`
+    /// feature) and runs any document-open (`/OpenAction /JavaScript`) scripts.
+    /// Field modifications produced by those scripts are applied immediately.
+    ///
+    /// Returns a `JsError` when the feature is not compiled in, or when the
+    /// QuickJS runtime cannot be initialised.
+    #[cfg(feature = "js-actions")]
+    pub fn enable_javascript(&mut self) -> Result<(), JsError> {
+        let engine = crate::js::JsEngine::new().map_err(|e| JsError::new(&e.to_string()))?;
+        let result =
+            crate::js::dispatch_doc_event(&self.editor.doc, &engine, crate::js::JsEvent::DocOpen)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+        // Apply field modifications requested by the doc-open script.
+        for (name, value) in result.modified_fields {
+            let _ = self.set_field_value(&name, &value);
+        }
+        self.js_engine = Some(engine);
+        Ok(())
+    }
+
+    /// Run a PDF JavaScript action script for a named field event.
+    ///
+    /// `event_type` must be one of: `"keystroke"`, `"validate"`, `"format"`,
+    /// `"calculate"`, `"mouseup"`.  Returns a JSON object:
+    /// `{"rc": bool, "value": string|null, "alerts": string[]}`.
+    ///
+    /// Returns `JsError` when JavaScript is not enabled (call
+    /// [`enable_javascript`](WasmEditor::enable_javascript) first) or the
+    /// feature is not compiled in.
+    #[cfg(feature = "js-actions")]
+    pub fn run_field_action(
+        &mut self,
+        field_name: &str,
+        event_type: &str,
+        value: &str,
+        change: &str,
+    ) -> Result<String, JsError> {
+        let engine = self.js_engine.as_ref().ok_or_else(|| {
+            JsError::new("JavaScript not enabled; call enable_javascript() first")
+        })?;
+
+        let event = match event_type {
+            "keystroke" => crate::js::JsEvent::FieldKeystroke {
+                field_name: field_name.to_owned(),
+                value: value.to_owned(),
+                change: change.to_owned(),
+            },
+            "validate" => crate::js::JsEvent::FieldValidate {
+                field_name: field_name.to_owned(),
+                value: value.to_owned(),
+            },
+            "format" => crate::js::JsEvent::FieldFormat {
+                field_name: field_name.to_owned(),
+                value: value.to_owned(),
+            },
+            "calculate" => crate::js::JsEvent::FieldCalculate {
+                field_name: field_name.to_owned(),
+            },
+            "mouseup" => crate::js::JsEvent::ButtonMouseUp {
+                field_name: field_name.to_owned(),
+            },
+            other => {
+                return Err(JsError::new(&format!(
+                    "unknown event_type '{}'; use keystroke/validate/format/calculate/mouseup",
+                    other
+                )))
+            }
+        };
+
+        let result = crate::js::dispatch_doc_event(&self.editor.doc, engine, event)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        // Apply field modifications.
+        for (name, val) in &result.modified_fields {
+            let _ = self.set_field_value(name, val);
+        }
+
+        let value_json = match &result.value {
+            Some(v) => super::json_str(v),
+            None => "null".to_string(),
+        };
+        let alerts_json: Vec<String> = result.alerts.iter().map(|a| super::json_str(a)).collect();
+        Ok(format!(
+            r#"{{"rc":{},"value":{},"alerts":[{}]}}"#,
+            result.rc,
+            value_json,
+            alerts_json.join(","),
+        ))
     }
 
     // ── Bookmarks ────────────────────────────────────────────────────────────

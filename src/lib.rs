@@ -24,11 +24,15 @@ pub mod error;
 pub mod fonts;
 #[cfg(feature = "forms")]
 pub mod forms;
+#[cfg(feature = "js-actions")]
+pub mod js;
 #[cfg(feature = "crypto")]
 pub mod license;
 pub mod parser;
 #[cfg(feature = "render")]
 pub mod render;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub mod server;
 #[cfg(feature = "signatures")]
 pub mod signatures;
 pub mod text;

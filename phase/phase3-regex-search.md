@@ -1,6 +1,6 @@
 # Phase 3 — Regex Search
 
-**Status:** Not started
+**Status:** Complete — 2026-06-17
 **Effort:** ~3–4 days (after Phase 1 full-text search is done)
 **Tier gate:** Pro
 **Prerequisite:** phase1-full-text-search.md must be complete
