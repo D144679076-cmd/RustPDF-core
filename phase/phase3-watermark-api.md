@@ -231,6 +231,8 @@ fn add_watermark_all_pages_applies_to_each_page() {
 ## Verification
 
 ```bash
-cargo test -- watermark
+cargo fmt --check
+cargo clippy --features writer -- -D warnings
+cargo test --features writer -- watermark
 cargo build --target wasm32-unknown-unknown --features wasm
 ```
