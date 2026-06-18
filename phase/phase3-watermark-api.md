@@ -1,6 +1,6 @@
 # Phase 3 — Watermark API (User-Facing)
 
-**Status:** Not started
+**Status:** Complete — 2026-06-18
 **Effort:** ~3–4 days
 **Tier gate:** Pro
 **Prerequisite:** phase1-licensing.md (watermark.rs already has `apply_trial_watermark`)

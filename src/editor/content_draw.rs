@@ -387,7 +387,7 @@ fn effective_resources(editor: &PdfEditor, page_dict: &PdfDict) -> PdfDict {
 /// inherited resources down onto the page, so existing fonts/xobjects are never
 /// dropped. The merged resources are inlined on the page dict, isolating the
 /// change from any `/Resources` object shared by other pages.
-fn register_resource_entry(
+pub(crate) fn register_resource_entry(
     editor: &mut PdfEditor,
     page_id: u32,
     category: &str,

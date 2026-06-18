@@ -19,6 +19,7 @@ pub mod text_encode;
 pub mod text_model;
 pub mod text_shape;
 pub mod text_style;
+pub mod watermark;
 
 pub use annotation::{
     add_annotation, delete_annotation, flatten_all_annotations, flatten_annotations,
@@ -53,4 +54,7 @@ pub use text_shape::{
 pub use text_style::{
     decoration_thickness, run_synthetic_style, strike_offset, underline_offset, ActiveStyle, Align,
     CharStyle, FontChoice, StyleRun, SyntheticStyle, OBLIQUE_SHEAR, SYNTHETIC_BOLD_STROKE_FRAC,
+};
+pub use watermark::{
+    add_image_watermark, add_text_watermark, add_watermark_all_pages, ImageWatermark, TextWatermark,
 };

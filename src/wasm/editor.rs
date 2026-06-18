@@ -1501,6 +1501,33 @@ fn json_opt_u32(json: &str, key: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
+/// Parse a `TextWatermark` from a JSON object string, applying defaults for missing fields.
+fn parse_text_watermark_json(json: &str) -> crate::error::Result<crate::editor::TextWatermark> {
+    let mut wm = crate::editor::TextWatermark::default();
+    if let Some(text) = json_str_field(json, "text")? {
+        wm.text = text;
+    }
+    if let Some(v) = json_f64_field(json, "font_size")? {
+        wm.font_size = v;
+    }
+    if let Some(c) = json_color_field(json, "color")? {
+        wm.color = c;
+    }
+    if let Some(v) = json_f64_field(json, "opacity")? {
+        wm.opacity = v;
+    }
+    if let Some(v) = json_f64_field(json, "angle_degrees")? {
+        wm.angle_degrees = v;
+    }
+    if let Some(v) = json_bool_field(json, "repeat")? {
+        wm.repeat = v;
+    }
+    if let Some(v) = json_f64_field(json, "tile_spacing")? {
+        wm.tile_spacing = v;
+    }
+    Ok(wm)
+}
+
 fn frames_to_json(
     doc: &crate::parser::objects::PdfDocument,
     page_index: usize,
@@ -1909,6 +1936,71 @@ impl WasmPdfWriter {
         let bytes = self.editor.save_append(&self.current_bytes)?;
         self.current_bytes = bytes.clone();
         Ok(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watermark
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen]
+impl WasmEditor {
+    /// Add a text watermark to a single page (0-based `page_index`).
+    ///
+    /// `options_json` is a JSON object with optional keys:
+    /// `text`, `font_size`, `color` ([r,g,b] in 0–1), `opacity`,
+    /// `angle_degrees`, `repeat`, `tile_spacing`. Missing keys use defaults.
+    /// Requires a Pro license.
+    pub fn add_text_watermark(
+        &mut self,
+        page_index: usize,
+        options_json: &str,
+    ) -> Result<(), JsError> {
+        let wm =
+            parse_text_watermark_json(options_json).map_err(|e| JsError::new(&e.to_string()))?;
+        crate::editor::add_text_watermark(&mut self.editor, page_index, &wm)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add a text watermark to every page in the document.
+    ///
+    /// Same `options_json` schema as [`add_text_watermark`]. Requires a Pro license.
+    pub fn add_watermark_all_pages(&mut self, options_json: &str) -> Result<(), JsError> {
+        let wm =
+            parse_text_watermark_json(options_json).map_err(|e| JsError::new(&e.to_string()))?;
+        crate::editor::add_watermark_all_pages(&mut self.editor, &wm)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Add an image watermark to a single page (0-based `page_index`).
+    ///
+    /// `pixels` — row-major raw pixel bytes. `channels`: 1=gray, 3=RGB, 4=CMYK.
+    /// `rect_x1/y1/x2/y2` — placement in PDF user-space points.
+    /// `opacity` — 0.0 invisible, 1.0 opaque. Requires a Pro license.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_image_watermark(
+        &mut self,
+        page_index: usize,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        channels: u8,
+        rect_x1: f64,
+        rect_y1: f64,
+        rect_x2: f64,
+        rect_y2: f64,
+        opacity: f64,
+    ) -> Result<(), JsError> {
+        let wm = crate::editor::ImageWatermark {
+            pixels: pixels.to_vec(),
+            width,
+            height,
+            channels,
+            rect: [rect_x1, rect_y1, rect_x2, rect_y2],
+            opacity,
+        };
+        crate::editor::add_image_watermark(&mut self.editor, page_index, &wm)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 }
 
