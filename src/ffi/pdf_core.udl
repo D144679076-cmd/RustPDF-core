@@ -1,0 +1,56 @@
+// pdf_core.udl — uniffi Universal Definition Language file
+//
+// Generate Swift bindings:
+//   uniffi-bindgen generate src/ffi/pdf_core.udl --language swift
+//
+// Generate Kotlin bindings:
+//   uniffi-bindgen generate src/ffi/pdf_core.udl --language kotlin
+
+namespace pdf_core {
+    /// Parse a PDF from raw bytes. Returns a document handle or throws PdfError.
+    [Throws=PdfError]
+    PdfDocument parse_document(bytes data);
+
+    /// Parse an encrypted PDF with a password.
+    [Throws=PdfError]
+    PdfDocument parse_document_with_password(bytes data, bytes password);
+
+    /// Search all pages of `doc` for `query`.
+    [Throws=PdfError]
+    sequence<SearchResult> search_document(PdfDocument doc, string query, boolean case_sensitive);
+};
+
+/// Represents a parsed PDF document.
+interface PdfDocument {
+    /// Total number of pages.
+    [Throws=PdfError]
+    u64 page_count();
+
+    /// Extract plain text from the page at `page_index` (0-based).
+    [Throws=PdfError]
+    string extract_text(u64 page_index);
+
+    /// Return document metadata as a JSON-encoded object string.
+    [Throws=PdfError]
+    string get_metadata_json();
+};
+
+/// A single search match within a document.
+dictionary SearchResult {
+    /// 0-based index of the page containing this match.
+    u64 page_index;
+    /// The matched text.
+    string text;
+    /// Bounding box [x1, y1, x2, y2] in PDF user-space (origin bottom-left).
+    sequence<double> bounds;
+};
+
+/// Error variants mirroring `PdfError` for cross-language throwing.
+[Error]
+enum PdfError {
+    "ParseError",
+    "WriteError",
+    "LicenseRequired",
+    "Encrypted",
+    "Other",
+};

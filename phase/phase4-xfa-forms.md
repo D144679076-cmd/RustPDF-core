@@ -1,6 +1,6 @@
 # Phase 4 — XFA Dynamic Forms
 
-**Status:** Not started
+**Status:** Complete — 2026-06-19 (see .doc/xfa-forms-2026-06-19.md)
 **Effort:** ~6–12 months
 **Tier gate:** Enterprise
 

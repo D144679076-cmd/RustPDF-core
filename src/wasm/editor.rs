@@ -1150,6 +1150,39 @@ impl WasmEditor {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
+    // ── XFA (XML Forms Architecture) ────────────────────────────────────────────
+
+    /// Whether this document carries an XFA form (`/AcroForm /XFA`).
+    ///
+    /// XFA is deprecated in PDF 2.0 and has no WASM rendering support — use
+    /// this to detect XFA forms before attempting [`Self::flatten_all_form_fields`]
+    /// and surface a clearer error to the user.
+    pub fn is_xfa_form(&self) -> bool {
+        crate::forms::is_xfa_form(&self.editor.doc).unwrap_or(false)
+    }
+
+    /// Extract the raw XFA XML data from `/AcroForm /XFA`. Requires an
+    /// Enterprise license. Errors if the document has no XFA form.
+    pub fn extract_xfa_data(&self) -> Result<String, JsError> {
+        crate::forms::extract_xfa_data(&self.editor.doc).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Flatten form fields, refusing XFA forms with a guidance error.
+    ///
+    /// WASM cannot run the LibreOffice-based XFA renderer (server-only); call
+    /// this instead of [`Self::flatten_all_form_fields`] when the document
+    /// might be an XFA form so JS callers get an actionable message rather
+    /// than a silently-ignored AcroForm flatten.
+    pub fn flatten_xfa_or_error(&mut self) -> Result<(), JsError> {
+        if self.is_xfa_form() {
+            return Err(JsError::new(
+                "XFA forms require server-side processing. Use the REST API endpoint /api/v1/form/xfa/flatten.",
+            ));
+        }
+        crate::forms::flatten_all_form_fields(&mut self.editor)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     // ── JavaScript actions ────────────────────────────────────────────────────
 
     /// Enable PDF JavaScript action execution for this document.

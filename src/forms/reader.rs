@@ -5,7 +5,7 @@
 
 use crate::document::catalog::Catalog;
 use crate::error::{PdfError, Result};
-use crate::parser::objects::{PdfDocument, PdfObject};
+use crate::parser::objects::{PdfDict, PdfDocument, PdfObject};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -104,6 +104,69 @@ pub fn read_form_fields(doc: &PdfDocument) -> Result<Vec<FormField>> {
         collect_fields(doc, field_ref, "", &page_refs, &mut result)?;
     }
     Ok(result)
+}
+
+/// Detect whether a PDF document carries an XFA (XML Forms Architecture) form.
+///
+/// XFA is an Adobe-proprietary form format stored in the `/AcroForm /XFA`
+/// key (deprecated in PDF 2.0, ISO 32000-2). Returns `Ok(false)` when the
+/// document has no `/AcroForm` at all.
+pub fn is_xfa_form(doc: &PdfDocument) -> Result<bool> {
+    match get_acroform_dict(doc)? {
+        Some(dict) => Ok(dict.contains_key("XFA")),
+        None => Ok(false),
+    }
+}
+
+/// Extract the raw XFA XML data from a PDF's `/AcroForm /XFA` entry.
+///
+/// The `/XFA` value is either a single stream or an array of alternating
+/// `[name, stream]` packet pairs (ISO 32000-2 §12.7.8); packets are
+/// concatenated in array order. Requires an Enterprise license.
+pub fn extract_xfa_data(doc: &PdfDocument) -> Result<String> {
+    #[cfg(feature = "crypto")]
+    crate::license::require(crate::license::Tier::Enterprise, "extract_xfa_data")?;
+
+    let acroform_dict = get_acroform_dict(doc)?
+        .ok_or_else(|| PdfError::invalid_structure("document has no /AcroForm"))?;
+    let xfa_ref = acroform_dict
+        .get("XFA")
+        .ok_or_else(|| PdfError::invalid_structure("document has no /XFA form"))?
+        .clone();
+    let xfa_obj = doc.resolve(&xfa_ref)?;
+
+    match xfa_obj {
+        PdfObject::Array(arr) => {
+            let mut xml = String::new();
+            let mut i = 0;
+            while i + 1 < arr.len() {
+                if let PdfObject::Stream(s) = doc.resolve(&arr[i + 1])? {
+                    xml.push_str(&String::from_utf8_lossy(&s.decode_with_doc(doc)?));
+                }
+                i += 2;
+            }
+            Ok(xml)
+        }
+        PdfObject::Stream(s) => Ok(String::from_utf8_lossy(&s.decode_with_doc(doc)?).into_owned()),
+        _ => Err(PdfError::invalid_structure(
+            "/XFA value is not a stream or array",
+        )),
+    }
+}
+
+/// Resolve and return the `/AcroForm` dictionary, or `None` if absent.
+fn get_acroform_dict(doc: &PdfDocument) -> Result<Option<PdfDict>> {
+    let catalog = Catalog::from_document(doc)?;
+    let acroform_ref = match catalog.acroform() {
+        Some(o) => o.clone(),
+        None => return Ok(None),
+    };
+    let acroform = doc.resolve(&acroform_ref)?;
+    let dict = acroform
+        .as_dict()
+        .ok_or_else(|| PdfError::invalid_structure("/AcroForm not a dict"))?
+        .clone();
+    Ok(Some(dict))
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -396,5 +459,154 @@ mod tests {
         let bytes = [0xFE, 0xFF, 0x00, 0x41, 0x00, 0x42];
         let s = pdf_string_to_utf8(&bytes);
         assert_eq!(s, "AB");
+    }
+
+    // ── XFA detection / extraction ─────────────────────────────────────────────
+
+    use crate::writer::document::PdfWriter;
+    use crate::writer::streams::make_raw_stream;
+
+    /// Build a minimal one-page-less document with an optional `/AcroForm` dict.
+    fn build_doc_with_acroform(acroform: Option<PdfDict>) -> PdfDocument {
+        let mut w = PdfWriter::new();
+        let mut pages = PdfDict::new();
+        pages.insert("Type".to_owned(), PdfObject::Name("Pages".to_owned()));
+        pages.insert("Kids".to_owned(), PdfObject::Array(vec![]));
+        pages.insert("Count".to_owned(), PdfObject::Integer(0));
+        let pages_id = w.add_object(PdfObject::Dictionary(pages));
+
+        let mut catalog = PdfDict::new();
+        catalog.insert("Type".to_owned(), PdfObject::Name("Catalog".to_owned()));
+        catalog.insert("Pages".to_owned(), PdfObject::Reference(pages_id, 0));
+        if let Some(af) = acroform {
+            let af_id = w.add_object(PdfObject::Dictionary(af));
+            catalog.insert("AcroForm".to_owned(), PdfObject::Reference(af_id, 0));
+        }
+        let cat_id = w.add_object(PdfObject::Dictionary(catalog));
+        let bytes = w.serialize_all(cat_id, None, None).unwrap();
+        PdfDocument::parse(bytes).unwrap()
+    }
+
+    #[test]
+    fn is_xfa_form_false_when_no_acroform() {
+        let doc = build_doc_with_acroform(None);
+        assert!(!is_xfa_form(&doc).unwrap());
+    }
+
+    #[test]
+    fn is_xfa_form_false_when_acroform_has_no_xfa() {
+        let mut af = PdfDict::new();
+        af.insert("Fields".to_owned(), PdfObject::Array(vec![]));
+        let doc = build_doc_with_acroform(Some(af));
+        assert!(!is_xfa_form(&doc).unwrap());
+    }
+
+    #[test]
+    fn is_xfa_form_true_when_xfa_key_present() {
+        let mut w = PdfWriter::new();
+        let stream = make_raw_stream(b"<xdp:xdp></xdp:xdp>".to_vec(), PdfDict::new());
+        let xfa_id = w.add_object(PdfObject::Stream(Box::new(stream)));
+
+        let mut pages = PdfDict::new();
+        pages.insert("Type".to_owned(), PdfObject::Name("Pages".to_owned()));
+        pages.insert("Kids".to_owned(), PdfObject::Array(vec![]));
+        pages.insert("Count".to_owned(), PdfObject::Integer(0));
+        let pages_id = w.add_object(PdfObject::Dictionary(pages));
+
+        let mut af = PdfDict::new();
+        af.insert("XFA".to_owned(), PdfObject::Reference(xfa_id, 0));
+        let af_id = w.add_object(PdfObject::Dictionary(af));
+
+        let mut catalog = PdfDict::new();
+        catalog.insert("Type".to_owned(), PdfObject::Name("Catalog".to_owned()));
+        catalog.insert("Pages".to_owned(), PdfObject::Reference(pages_id, 0));
+        catalog.insert("AcroForm".to_owned(), PdfObject::Reference(af_id, 0));
+        let cat_id = w.add_object(PdfObject::Dictionary(catalog));
+
+        let bytes = w.serialize_all(cat_id, None, None).unwrap();
+        let doc = PdfDocument::parse(bytes).unwrap();
+        assert!(is_xfa_form(&doc).unwrap());
+    }
+
+    #[test]
+    fn extract_xfa_data_errors_when_no_acroform() {
+        let doc = build_doc_with_acroform(None);
+        let err = extract_xfa_data(&doc).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidStructure { .. }));
+    }
+
+    #[test]
+    fn extract_xfa_data_errors_when_no_xfa_key() {
+        let af = PdfDict::new();
+        let doc = build_doc_with_acroform(Some(af));
+        let err = extract_xfa_data(&doc).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidStructure { .. }));
+    }
+
+    #[test]
+    fn extract_xfa_data_single_stream() {
+        let mut w = PdfWriter::new();
+        let xml = b"<xdp:xdp>single packet</xdp:xdp>".to_vec();
+        let stream = make_raw_stream(xml.clone(), PdfDict::new());
+        let xfa_id = w.add_object(PdfObject::Stream(Box::new(stream)));
+
+        let mut pages = PdfDict::new();
+        pages.insert("Type".to_owned(), PdfObject::Name("Pages".to_owned()));
+        pages.insert("Kids".to_owned(), PdfObject::Array(vec![]));
+        pages.insert("Count".to_owned(), PdfObject::Integer(0));
+        let pages_id = w.add_object(PdfObject::Dictionary(pages));
+
+        let mut af = PdfDict::new();
+        af.insert("XFA".to_owned(), PdfObject::Reference(xfa_id, 0));
+        let af_id = w.add_object(PdfObject::Dictionary(af));
+
+        let mut catalog = PdfDict::new();
+        catalog.insert("Type".to_owned(), PdfObject::Name("Catalog".to_owned()));
+        catalog.insert("Pages".to_owned(), PdfObject::Reference(pages_id, 0));
+        catalog.insert("AcroForm".to_owned(), PdfObject::Reference(af_id, 0));
+        let cat_id = w.add_object(PdfObject::Dictionary(catalog));
+
+        let bytes = w.serialize_all(cat_id, None, None).unwrap();
+        let doc = PdfDocument::parse(bytes).unwrap();
+        let result = extract_xfa_data(&doc).unwrap();
+        assert_eq!(result, String::from_utf8(xml).unwrap());
+    }
+
+    #[test]
+    fn extract_xfa_data_packet_array_concatenates_in_order() {
+        let mut w = PdfWriter::new();
+        let template_stream = make_raw_stream(b"<template/>".to_vec(), PdfDict::new());
+        let template_id = w.add_object(PdfObject::Stream(Box::new(template_stream)));
+        let datasets_stream = make_raw_stream(b"<datasets/>".to_vec(), PdfDict::new());
+        let datasets_id = w.add_object(PdfObject::Stream(Box::new(datasets_stream)));
+
+        let xfa_array = PdfObject::Array(vec![
+            PdfObject::Name("template".to_owned()),
+            PdfObject::Reference(template_id, 0),
+            PdfObject::Name("datasets".to_owned()),
+            PdfObject::Reference(datasets_id, 0),
+        ]);
+        let xfa_id = w.add_object(xfa_array);
+
+        let mut pages = PdfDict::new();
+        pages.insert("Type".to_owned(), PdfObject::Name("Pages".to_owned()));
+        pages.insert("Kids".to_owned(), PdfObject::Array(vec![]));
+        pages.insert("Count".to_owned(), PdfObject::Integer(0));
+        let pages_id = w.add_object(PdfObject::Dictionary(pages));
+
+        let mut af = PdfDict::new();
+        af.insert("XFA".to_owned(), PdfObject::Reference(xfa_id, 0));
+        let af_id = w.add_object(PdfObject::Dictionary(af));
+
+        let mut catalog = PdfDict::new();
+        catalog.insert("Type".to_owned(), PdfObject::Name("Catalog".to_owned()));
+        catalog.insert("Pages".to_owned(), PdfObject::Reference(pages_id, 0));
+        catalog.insert("AcroForm".to_owned(), PdfObject::Reference(af_id, 0));
+        let cat_id = w.add_object(PdfObject::Dictionary(catalog));
+
+        let bytes = w.serialize_all(cat_id, None, None).unwrap();
+        let doc = PdfDocument::parse(bytes).unwrap();
+        let result = extract_xfa_data(&doc).unwrap();
+        assert_eq!(result, "<template/><datasets/>");
     }
 }

@@ -19,6 +19,9 @@ pub fn build_router() -> axum::Router {
         .route("/api/v1/redact", post(handlers::redact))
         .route("/api/v1/form/export-fdf", post(handlers::export_fdf))
         .route("/api/v1/form/import-fdf", post(handlers::import_fdf))
+        .route("/api/v1/form/xfa/detect", post(handlers::xfa_detect))
+        .route("/api/v1/form/xfa/extract", post(handlers::xfa_extract))
+        .route("/api/v1/form/xfa/flatten", post(handlers::xfa_flatten))
         .route(
             "/api/v1/annotate/flatten",
             post(handlers::flatten_annotations),

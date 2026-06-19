@@ -51,6 +51,10 @@ serde = { version = "1", optional = true, features = ["derive"] }
 png = { version = "0.17", optional = true }
 # Logger for the pdf-server binary.
 env_logger = { version = "0.11", optional = true }
+# Mobile SDK: uniffi generates Swift/Kotlin bindings from Rust proc-macro annotations.
+# Language bindings are produced at SDK-build time with `uniffi-bindgen generate`.
+# Native only — not included in any WASM feature set.
+uniffi = { version = "0.25", optional = true }
 
 [features]
 crypto = ["dep:md-5", "dep:sha2", "dep:aes", "dep:cbc", "dep:hmac", "dep:base64", "dep:getrandom"]
@@ -60,6 +64,12 @@ forms  = ["writer"]
 signatures = ["dep:rsa", "dep:x509-cert", "crypto", "writer"]
 js-actions = ["dep:rquickjs"]
 search = ["dep:regex"]
+# C FFI layer — raw extern "C" functions for native mobile integration (Phase 4a).
+# Excludes all WASM targets; guard with #[cfg(not(target_arch = "wasm32"))].
+ffi = ["search"]
+# Mobile SDK — C FFI + uniffi-generated Swift/Kotlin bindings (Phase 4b/4c).
+# Enterprise tier. Native only.
+mobile = ["ffi", "dep:uniffi", "search"]
 # WASM bridge: exposes #[wasm_bindgen] types for JS integration.
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto", "js-actions", "search"]
 # WASM bridge with page rendering included (adds ~800 KB to the WASM binary).

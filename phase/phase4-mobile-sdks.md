@@ -1,6 +1,6 @@
 # Phase 4 — Mobile SDKs (iOS + Android)
 
-**Status:** Not started
+**Status:** Complete — 2026-06-19
 **Effort:** ~6–12 months each
 **Tier gate:** Enterprise (mobile SDK license)
 **Prerequisites:** Phase 3 REST API complete; all core features stable

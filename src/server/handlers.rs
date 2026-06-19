@@ -476,6 +476,123 @@ pub async fn import_fdf(multipart: Multipart) -> Response {
     }
 }
 
+// ── POST /api/v1/form/xfa/detect ──────────────────────────────────────────────
+
+/// Detect whether a PDF carries an XFA (XML Forms Architecture) form.
+///
+/// Body: raw PDF bytes.
+/// Returns JSON: `{"is_xfa": true|false}`.
+pub async fn xfa_detect(body: Bytes) -> Response {
+    let result: Result<bool, String> = tokio::task::spawn_blocking(move || {
+        let doc =
+            crate::parser::objects::PdfDocument::parse(body.to_vec()).map_err(|e| e.to_string())?;
+        crate::forms::is_xfa_form(&doc).map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking panic: {e}")));
+
+    match result {
+        Ok(is_xfa) => json_response(serde_json::json!({ "is_xfa": is_xfa }).to_string()),
+        Err(e) => unprocessable(e),
+    }
+}
+
+// ── POST /api/v1/form/xfa/extract ─────────────────────────────────────────────
+
+/// Extract the raw XFA XML data from a PDF's `/AcroForm /XFA` entry.
+///
+/// Body: raw PDF bytes.
+/// Returns the XFA XML as `text/xml`. 422 if the document has no XFA form.
+pub async fn xfa_extract(body: Bytes) -> Response {
+    let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+        let doc =
+            crate::parser::objects::PdfDocument::parse(body.to_vec()).map_err(|e| e.to_string())?;
+        crate::forms::extract_xfa_data(&doc).map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking panic: {e}")));
+
+    match result {
+        Ok(xml) => (StatusCode::OK, [("content-type", "text/xml")], xml).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+// ── POST /api/v1/form/xfa/flatten ─────────────────────────────────────────────
+
+/// Flatten an XFA form into a static PDF by round-tripping it through
+/// LibreOffice headless (`soffice --convert-to pdf`).
+///
+/// LibreOffice's PDF import/export does not preserve XFA interactivity, so
+/// the resulting file is a flattened, non-interactive rendering. Requires
+/// the `libreoffice` (or `soffice`) binary to be on `$PATH`.
+///
+/// Body: raw PDF bytes.
+/// Returns flattened PDF bytes. 422 if the document is not an XFA form, the
+/// binary is missing, or conversion fails.
+pub async fn xfa_flatten(body: Bytes) -> Response {
+    let result: Result<Vec<u8>, String> = tokio::task::spawn_blocking(move || {
+        let doc =
+            crate::parser::objects::PdfDocument::parse(body.to_vec()).map_err(|e| e.to_string())?;
+        if !crate::forms::is_xfa_form(&doc).map_err(|e| e.to_string())? {
+            return Err("document is not an XFA form".to_owned());
+        }
+        flatten_xfa_via_libreoffice(&body)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking panic: {e}")));
+
+    match result {
+        Ok(pdf) => pdf_response(pdf),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// Round-trip `pdf_bytes` through LibreOffice headless to flatten XFA content.
+///
+/// Writes to a uniquely-named file under the OS temp dir, converts in place
+/// (LibreOffice writes its `--convert-to pdf` output back to the same path
+/// since the input is already a `.pdf`), reads the result back, and removes
+/// the temp file regardless of outcome.
+fn flatten_xfa_via_libreoffice(pdf_bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("pdf-core-xfa-{}-{nonce}.pdf", std::process::id()));
+
+    std::fs::write(&path, pdf_bytes).map_err(|e| format!("failed to write temp file: {e}"))?;
+
+    let convert_result = std::process::Command::new("libreoffice")
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(&dir)
+        .arg(&path)
+        .status();
+
+    let status = match convert_result {
+        Ok(s) => s,
+        Err(_) => std::process::Command::new("soffice")
+            .args(["--headless", "--convert-to", "pdf", "--outdir"])
+            .arg(&dir)
+            .arg(&path)
+            .status()
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&path);
+                format!("failed to spawn libreoffice/soffice: {e}")
+            })?,
+    };
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err("LibreOffice conversion failed".to_owned());
+    }
+
+    let flattened = std::fs::read(&path).map_err(|e| format!("failed to read output: {e}"));
+    let _ = std::fs::remove_file(&path);
+    flattened
+}
+
 // ── POST /api/v1/annotate/flatten ─────────────────────────────────────────────
 
 /// Flatten all annotations in a PDF (burn them into page content).

@@ -21,6 +21,8 @@ pub mod document;
 #[cfg(feature = "writer")]
 pub mod editor;
 pub mod error;
+#[cfg(all(feature = "ffi", not(target_arch = "wasm32")))]
+pub mod ffi;
 pub mod fonts;
 #[cfg(feature = "forms")]
 pub mod forms;
@@ -40,6 +42,11 @@ pub mod text;
 pub mod wasm;
 #[cfg(feature = "writer")]
 pub mod writer;
+
+// uniffi scaffolding initialisation — enables `uniffi-bindgen generate` to
+// produce Swift/Kotlin wrappers from the compiled native library.
+#[cfg(all(feature = "mobile", not(target_arch = "wasm32")))]
+uniffi::setup_scaffolding!("pdf_core");
 
 // Re-export the most commonly used public types at the crate root.
 #[cfg(feature = "writer")]
