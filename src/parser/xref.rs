@@ -531,6 +531,25 @@ fn parse_xref_stream_bytes(
     Ok(map)
 }
 
+/// Parse the `startxref` byte offset from the tail bytes of a PDF file.
+///
+/// `tail` should be the last few KB of the file (typically 4096 bytes).
+/// Searches backwards for the `startxref` keyword and returns the file offset
+/// value that follows it. Returns `None` if the keyword or its numeric argument
+/// are absent, or if the number cannot be parsed.
+pub fn find_startxref(tail: &[u8]) -> Option<u64> {
+    let keyword = b"startxref";
+    let pos = (0..=tail.len().saturating_sub(keyword.len()))
+        .rev()
+        .find(|&i| &tail[i..i + keyword.len()] == keyword)?;
+    let after = skip_whitespace_and_comments(&tail[pos + keyword.len()..]);
+    let num_end = after.iter().position(|&b| !b.is_ascii_digit())?;
+    if num_end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&after[..num_end]).ok()?.parse().ok()
+}
+
 // -----------------------------------------------------------------------------
 // Lexer Whitespace Skip Mirror
 // -----------------------------------------------------------------------------

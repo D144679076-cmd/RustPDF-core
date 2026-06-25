@@ -10,6 +10,7 @@ pub mod document;
 // Editor and writer bindings require the full wasm feature (writer + forms + crypto).
 #[cfg(any(feature = "wasm", feature = "wasm-render"))]
 pub mod editor;
+pub mod streaming;
 #[cfg(any(feature = "wasm", feature = "wasm-render"))]
 pub mod text_edit;
 

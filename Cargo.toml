@@ -47,6 +47,8 @@ tokio = { version = "1", optional = true, features = ["full"] }
 tower-http = { version = "0.5", optional = true, features = ["cors", "limit"] }
 serde_json = { version = "1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
+# OpenAPI spec generation from utoipa proc-macro annotations.
+utoipa = { version = "4", optional = true, features = ["axum_extras"] }
 # PNG encoding for the /render endpoint (RGBA → PNG via pure-Rust encoder).
 png = { version = "0.17", optional = true }
 # Logger for the pdf-server binary.
@@ -79,7 +81,7 @@ wasm-viewer = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console
 # REST API server — Enterprise tier, native only.
 # render is NOT listed here because it requires the core-fonts directory at
 # build time (include_bytes!). Enable it separately with --features server,render.
-server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:serde_json", "dep:serde", "dep:png", "dep:env_logger", "writer", "forms", "crypto", "search"]
+server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:serde_json", "dep:serde", "dep:png", "dep:env_logger", "dep:utoipa", "writer", "forms", "crypto", "search"]
 
 [[bin]]
 name = "pdf-inspect"

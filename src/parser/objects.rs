@@ -1002,6 +1002,47 @@ fn find_startxref_offset(data: &[u8]) -> Result<usize> {
 /// Parse the value of an indirect object at a raw byte offset.
 ///
 /// Consumes `N G obj` then returns the parsed value, without stream handling.
+/// Used by the streaming module and the crypto resolver to read specific objects
+/// from a byte slice without constructing a full `PdfDocument`.
+pub(crate) fn parse_indirect_object(data: &[u8], offset: usize) -> Result<PdfObject> {
+    if offset >= data.len() {
+        return Err(PdfError::eof(offset, "object offset out of file bounds"));
+    }
+    let slice = skip_pdf_whitespace(&data[offset..]);
+    let mut lexer = Lexer::new(slice);
+    match lexer.next_token()? {
+        Token::Integer(_) => {}
+        t => {
+            return Err(PdfError::invalid_token(
+                offset,
+                format!("expected object number, found {:?}", t),
+            ))
+        }
+    }
+    match lexer.next_token()? {
+        Token::Integer(_) => {}
+        t => {
+            return Err(PdfError::invalid_token(
+                offset,
+                format!("expected generation number, found {:?}", t),
+            ))
+        }
+    }
+    match lexer.next_token()? {
+        Token::Keyword(Keyword::Obj) => {}
+        t => {
+            return Err(PdfError::invalid_token(
+                offset,
+                format!("expected 'obj', found {:?}", t),
+            ))
+        }
+    }
+    parse_object_from_lexer(&mut lexer)
+}
+
+/// Parse the value of an indirect object at a raw byte offset.
+///
+/// Consumes `N G obj` then returns the parsed value, without stream handling.
 /// Used to resolve indirect references before a `PdfDocument` is constructed.
 #[cfg(feature = "crypto")]
 fn parse_object_at_offset(data: &[u8], offset: usize) -> Result<PdfObject> {

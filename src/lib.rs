@@ -37,6 +37,7 @@ pub mod render;
 pub mod server;
 #[cfg(feature = "signatures")]
 pub mod signatures;
+pub mod streaming;
 pub mod text;
 #[cfg(feature = "wasm")]
 pub mod wasm;

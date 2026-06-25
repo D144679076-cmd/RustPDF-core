@@ -8,9 +8,20 @@
 //! ```bash
 //! PDF_CORE_LICENSE=<enterprise_key> cargo run --features server --bin pdf-server
 //! ```
+//!
+//! Dump OpenAPI spec and exit:
+//! ```bash
+//! cargo run --features server --bin pdf-server -- --dump-openapi > openapi.yaml
+//! ```
 
 #[tokio::main]
 async fn main() {
+    // --dump-openapi: print the OpenAPI JSON spec to stdout and exit.
+    if std::env::args().any(|a| a == "--dump-openapi") {
+        print!("{}", pdf_core::server::openapi_json());
+        return;
+    }
+
     env_logger::init();
 
     // Pre-activate license from environment variable if provided.

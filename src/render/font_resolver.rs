@@ -84,34 +84,34 @@ pub unsafe extern "C" fn pdf_register_font(
 // ─── Embedded font data (Liberation + DejaVu) ─────────────────────────────────
 
 static LIBERATION_SANS_REGULAR: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSans-Regular.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSans-Regular.ttf");
 static LIBERATION_SANS_BOLD: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSans-Bold.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSans-Bold.ttf");
 static LIBERATION_SANS_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSans-Italic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSans-Italic.ttf");
 static LIBERATION_SANS_BOLD_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSans-BoldItalic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSans-BoldItalic.ttf");
 
 static LIBERATION_SERIF_REGULAR: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSerif-Regular.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSerif-Regular.ttf");
 static LIBERATION_SERIF_BOLD: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSerif-Bold.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSerif-Bold.ttf");
 static LIBERATION_SERIF_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSerif-Italic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSerif-Italic.ttf");
 static LIBERATION_SERIF_BOLD_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationSerif-BoldItalic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationSerif-BoldItalic.ttf");
 
 static LIBERATION_MONO_REGULAR: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationMono-Regular.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationMono-Regular.ttf");
 static LIBERATION_MONO_BOLD: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationMono-Bold.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationMono-Bold.ttf");
 static LIBERATION_MONO_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationMono-Italic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationMono-Italic.ttf");
 static LIBERATION_MONO_BOLD_ITALIC: &[u8] =
-    include_bytes!("../../../core-fonts/liberation/LiberationMono-BoldItalic.ttf");
+    include_bytes!("../../../commercial-fonts/liberation/LiberationMono-BoldItalic.ttf");
 
 // Best available fallback for Symbol and ZapfDingbats.
-static DEJAVU_SANS: &[u8] = include_bytes!("../../../core-fonts/dejavu/DejaVuSans.ttf");
+static DEJAVU_SANS: &[u8] = include_bytes!("../../../commercial-fonts/dejavu/DejaVuSans.ttf");
 
 /// Display names of every font family the embedded resolver can render distinctly.
 ///
@@ -191,7 +191,8 @@ pub fn normalize_font_name(name: &str) -> (String, bool, bool) {
     let family_raw = name.split(['-', ',']).next().unwrap_or(name);
     // Strip common suffixes like " MT", " PS" and collapse whitespace.
     let family = family_raw
-        .trim_end_matches(|c: char| c.is_alphabetic() && family_raw.ends_with(" MT"))
+        .trim_end_matches(" MT")
+        .trim_end_matches(" PS")
         .trim();
     let family = family
         .to_lowercase()

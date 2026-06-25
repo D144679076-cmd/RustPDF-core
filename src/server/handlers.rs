@@ -42,6 +42,14 @@ fn bad_request(msg: &str) -> Response {
 /// Return a JSON health payload.
 ///
 /// Does not require a license key — safe for monitoring probes.
+#[utoipa::path(
+    get,
+    path = "/api/v1/health",
+    tag = "document",
+    responses(
+        (status = 200, description = "Server is healthy", content_type = "application/json"),
+    )
+)]
 pub async fn health() -> Response {
     let body = serde_json::json!({
         "status": "ok",
@@ -61,6 +69,21 @@ pub async fn health() -> Response {
 ///
 /// Returns PNG bytes. Requires the `render` Cargo feature in addition to
 /// `server`; returns 501 Not Implemented when render is not compiled in.
+#[utoipa::path(
+    post,
+    path = "/api/v1/render",
+    tag = "render",
+    params(
+        ("page" = Option<usize>, Query, description = "0-based page index (default 0)"),
+        ("scale" = Option<f64>, Query, description = "Render scale factor (default 1.0)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "PNG image bytes", content_type = "image/png"),
+        (status = 422, description = "PDF processing error"),
+        (status = 501, description = "render feature not compiled"),
+    )
+)]
 pub async fn render(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     #[cfg(not(feature = "render"))]
     {
@@ -119,6 +142,19 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, p
 /// - `page` (optional): if present, extract only that 0-based page index.
 ///
 /// Returns JSON: `{"pages": [{"page": N, "text": "..."}]}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/extract-text",
+    tag = "document",
+    params(
+        ("page" = Option<usize>, Query, description = "0-based page index; omit for all pages"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = r#"{"pages":[{"page":0,"text":"..."}]}"#, content_type = "application/json"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn extract_text(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     let result: Result<String, String> = tokio::task::spawn_blocking(move || {
         let doc =
@@ -170,6 +206,22 @@ pub async fn extract_text(Query(params): Query<HashMap<String, String>>, body: B
 /// - `page` (optional): if present, search only that 0-based page index.
 ///
 /// Returns JSON: `{"results": [{"page": N, "text": "...", "bounds": [x1,y1,x2,y2]}]}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/search",
+    tag = "document",
+    params(
+        ("q" = String, Query, description = "Search term (required)"),
+        ("case_sensitive" = Option<bool>, Query, description = "Case-sensitive match (default false)"),
+        ("page" = Option<usize>, Query, description = "Limit to a single page (optional)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = r#"{"results":[{"page":0,"text":"...","bounds":[x1,y1,x2,y2]}]}"#, content_type = "application/json"),
+        (status = 400, description = "Missing query parameter"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn search(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     let query_str = match params.get("q") {
         Some(q) => q.clone(),
@@ -223,6 +275,17 @@ pub async fn search(Query(params): Query<HashMap<String, String>>, body: Bytes) 
 /// (or any name — all parts are collected in order).
 ///
 /// Returns merged PDF bytes.
+#[utoipa::path(
+    post,
+    path = "/api/v1/merge",
+    tag = "document",
+    request_body(content = String, content_type = "multipart/form-data", description = "One or more PDF parts under any field name"),
+    responses(
+        (status = 200, description = "Merged PDF bytes", content_type = "application/pdf"),
+        (status = 400, description = "No files provided"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn merge(multipart: Multipart) -> Response {
     let files = match super::multipart::collect_multipart_files(multipart).await {
         Ok(f) => f,
@@ -258,6 +321,21 @@ pub async fn merge(multipart: Multipart) -> Response {
 /// - `end` (required): last page to include (0-based, inclusive).
 ///
 /// Returns PDF bytes containing only the selected pages.
+#[utoipa::path(
+    post,
+    path = "/api/v1/split",
+    tag = "document",
+    params(
+        ("start" = Option<usize>, Query, description = "First page to include, 0-based inclusive (default 0)"),
+        ("end" = usize, Query, description = "Last page to include, 0-based inclusive (required)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "Extracted page range as PDF", content_type = "application/pdf"),
+        (status = 400, description = "Missing or invalid parameters"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn split(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     let start: usize = params
         .get("start")
@@ -316,6 +394,17 @@ fn default_dpi() -> u32 {
 /// field (JSON object). If `options` is omitted, defaults are used.
 ///
 /// Returns optimized PDF bytes.
+#[utoipa::path(
+    post,
+    path = "/api/v1/optimize",
+    tag = "document",
+    request_body(content = String, content_type = "multipart/form-data", description = "Fields: `pdf` (PDF bytes), `options` (optional JSON {recompress_streams,deduplicate_resources,remove_unused_objects,downsample_images,image_max_dpi})"),
+    responses(
+        (status = 200, description = "Optimized PDF bytes", content_type = "application/pdf"),
+        (status = 400, description = "Missing or invalid fields"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn optimize(multipart: Multipart) -> Response {
     let mut parts = match super::multipart::collect_named_parts(multipart).await {
         Ok(p) => p,
@@ -372,6 +461,17 @@ struct RedactZoneRequest {
 /// (JSON array of `{page_index, rect, overlay_color?}` objects).
 ///
 /// Returns a new PDF with redacted content replaced by filled rectangles.
+#[utoipa::path(
+    post,
+    path = "/api/v1/redact",
+    tag = "document",
+    request_body(content = String, content_type = "multipart/form-data", description = "Fields: `pdf` (PDF bytes), `zones` (JSON array of {page_index, rect:[x1,y1,x2,y2], overlay_color?:[r,g,b]})"),
+    responses(
+        (status = 200, description = "Redacted PDF bytes", content_type = "application/pdf"),
+        (status = 400, description = "Missing or invalid fields"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn redact(multipart: Multipart) -> Response {
     let mut parts = match super::multipart::collect_named_parts(multipart).await {
         Ok(p) => p,
@@ -421,6 +521,16 @@ pub async fn redact(multipart: Multipart) -> Response {
 ///
 /// Body: raw PDF bytes.
 /// Returns FDF bytes (application/vnd.fdf).
+#[utoipa::path(
+    post,
+    path = "/api/v1/form/export-fdf",
+    tag = "forms",
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "FDF form data bytes", content_type = "application/vnd.fdf"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn export_fdf(body: Bytes) -> Response {
     let result: Result<Vec<u8>, String> = tokio::task::spawn_blocking(move || {
         let doc =
@@ -447,6 +557,17 @@ pub async fn export_fdf(body: Bytes) -> Response {
 ///
 /// Body: multipart with a `pdf` field (PDF bytes) and an `fdf` field (FDF bytes).
 /// Returns an updated PDF with the form fields filled.
+#[utoipa::path(
+    post,
+    path = "/api/v1/form/import-fdf",
+    tag = "forms",
+    request_body(content = String, content_type = "multipart/form-data", description = "Fields: `pdf` (PDF bytes), `fdf` (FDF bytes)"),
+    responses(
+        (status = 200, description = "Updated PDF with form fields filled", content_type = "application/pdf"),
+        (status = 400, description = "Missing multipart fields"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn import_fdf(multipart: Multipart) -> Response {
     let mut parts = match super::multipart::collect_named_parts(multipart).await {
         Ok(p) => p,
@@ -482,6 +603,16 @@ pub async fn import_fdf(multipart: Multipart) -> Response {
 ///
 /// Body: raw PDF bytes.
 /// Returns JSON: `{"is_xfa": true|false}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/form/xfa/detect",
+    tag = "forms",
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = r#"{"is_xfa": true}"#, content_type = "application/json"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn xfa_detect(body: Bytes) -> Response {
     let result: Result<bool, String> = tokio::task::spawn_blocking(move || {
         let doc =
@@ -503,6 +634,16 @@ pub async fn xfa_detect(body: Bytes) -> Response {
 ///
 /// Body: raw PDF bytes.
 /// Returns the XFA XML as `text/xml`. 422 if the document has no XFA form.
+#[utoipa::path(
+    post,
+    path = "/api/v1/form/xfa/extract",
+    tag = "forms",
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "XFA XML data", content_type = "text/xml"),
+        (status = 422, description = "Not an XFA form or PDF processing error"),
+    )
+)]
 pub async fn xfa_extract(body: Bytes) -> Response {
     let result: Result<String, String> = tokio::task::spawn_blocking(move || {
         let doc =
@@ -530,6 +671,16 @@ pub async fn xfa_extract(body: Bytes) -> Response {
 /// Body: raw PDF bytes.
 /// Returns flattened PDF bytes. 422 if the document is not an XFA form, the
 /// binary is missing, or conversion fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/form/xfa/flatten",
+    tag = "forms",
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "XFA PDF file bytes"),
+    responses(
+        (status = 200, description = "Flattened static PDF bytes", content_type = "application/pdf"),
+        (status = 422, description = "Not an XFA form, LibreOffice unavailable, or conversion failed"),
+    )
+)]
 pub async fn xfa_flatten(body: Bytes) -> Response {
     let result: Result<Vec<u8>, String> = tokio::task::spawn_blocking(move || {
         let doc =
@@ -599,6 +750,16 @@ fn flatten_xfa_via_libreoffice(pdf_bytes: &[u8]) -> std::result::Result<Vec<u8>,
 ///
 /// Body: raw PDF bytes.
 /// Returns PDF bytes with annotations removed and their appearance burned in.
+#[utoipa::path(
+    post,
+    path = "/api/v1/annotate/flatten",
+    tag = "document",
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "PDF with annotations burned into content", content_type = "application/pdf"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn flatten_annotations(body: Bytes) -> Response {
     let result: Result<Vec<u8>, String> = tokio::task::spawn_blocking(move || {
         let mut editor =
@@ -656,6 +817,17 @@ fn default_font() -> String {
 /// (JSON `WatermarkRequest`). Applies the watermark to one or all pages.
 ///
 /// Returns PDF bytes with the watermark added.
+#[utoipa::path(
+    post,
+    path = "/api/v1/watermark",
+    tag = "document",
+    request_body(content = String, content_type = "multipart/form-data", description = "Fields: `pdf` (PDF bytes), `watermark` (JSON {text, x, y, font_size?, color?:[r,g,b], font_name?, page?})"),
+    responses(
+        (status = 200, description = "Watermarked PDF bytes", content_type = "application/pdf"),
+        (status = 400, description = "Missing or invalid multipart fields"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
 pub async fn watermark(multipart: Multipart) -> Response {
     let mut parts = match super::multipart::collect_named_parts(multipart).await {
         Ok(p) => p,
@@ -725,6 +897,19 @@ struct ViolationJson {
 /// - `level` (default `1b`): one of `1b`, `2b`, `3b`.
 ///
 /// Returns JSON: `{"level": "1b", "conformant": true, "violations": [...]}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/validate-pdfa",
+    tag = "pdfa",
+    params(
+        ("level" = Option<String>, Query, description = "PDF/A conformance level: 1b, 2b, or 3b (default 1b)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = r#"{"level":"1b","conformant":true,"violations":[]}"#, content_type = "application/json"),
+        (status = 422, description = "PDF processing error or unknown level"),
+    )
+)]
 pub async fn validate_pdfa(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     let level = params
         .get("level")
@@ -781,6 +966,19 @@ pub async fn validate_pdfa(Query(params): Query<HashMap<String, String>>, body: 
 ///
 /// Body: raw PDF bytes.
 /// Returns PDF/A-conformant PDF bytes.
+#[utoipa::path(
+    post,
+    path = "/api/v1/convert-pdfa",
+    tag = "pdfa",
+    params(
+        ("level" = Option<String>, Query, description = "PDF/A conformance level: 1b, 2b, or 3b (default 1b)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "PDF/A-conformant PDF bytes", content_type = "application/pdf"),
+        (status = 422, description = "PDF processing error or unknown level"),
+    )
+)]
 pub async fn convert_pdfa(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
     let level = params
         .get("level")

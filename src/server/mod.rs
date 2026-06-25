@@ -12,3 +12,4 @@ pub mod multipart;
 pub mod routes;
 
 pub use routes::build_router;
+pub use routes::openapi_json;
