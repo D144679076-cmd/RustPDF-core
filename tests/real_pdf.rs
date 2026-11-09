@@ -378,9 +378,28 @@ fn garbage_bytes_fail_to_parse() {
 }
 
 #[test]
-fn truncated_pdf_fails() {
+fn truncated_pdf_exists_but_recovers() {
+    // Half-cut file still contains the catalog + page tree bodies, so
+    // XRef recovery (ISO 32000-2 §7.5.4 / pdf.js repair semantics) now
+    // salvages it instead of hard-failing. Severe truncation — where no
+    // object survives — must still fail (next test).
     let path = fixture_path("minimal.pdf");
     let full = std::fs::read(&path).unwrap();
     let truncated = full[..full.len() / 2].to_vec();
+    let doc = PdfDocument::parse(truncated)
+        .expect("truncation salvageable by body-marker recovery must parse");
+    // Object 1 (catalog) must be present; the page tree may or may not be.
+    assert!(
+        doc.get_object(1).is_ok(),
+        "catalog object must survive truncation recovery"
+    );
+}
+
+#[test]
+fn severely_truncated_pdf_fails() {
+    // Cut everything past the header — no object bodies survive.
+    let path = fixture_path("minimal.pdf");
+    let full = std::fs::read(&path).unwrap();
+    let truncated = full[..40.min(full.len())].to_vec();
     assert!(PdfDocument::parse(truncated).is_err());
 }

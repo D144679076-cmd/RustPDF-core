@@ -16,6 +16,10 @@ use crate::parser::filters;
 use crate::parser::lexer::{Keyword, Lexer, Token};
 use crate::parser::version;
 
+// XRef recovery / reconstruction for damaged files. Child module so it can
+// see the private `XRefEntry` type; API stays private to this crate.
+mod recovery;
+
 // ---------------------------------------------------------------------------
 // Public object types
 // ---------------------------------------------------------------------------
@@ -277,8 +281,7 @@ impl PdfDocument {
             // version gates downstream encryption policy (RC4 forbidden in
             // PDF 2.0 files) and string decoding.
             let version = version::detect_version(&data)?;
-            let start = find_startxref_offset(&data)?;
-            let (xref, trailer) = build_xref(&data, start)?;
+            let (xref, trailer) = recovery::load_xref(&data, find_startxref_offset(&data).ok())?;
             if trailer.contains_key("Encrypt") {
                 return Err(PdfError::Encrypted { offset: 0 });
             }
@@ -304,8 +307,7 @@ impl PdfDocument {
         // Header scan first (§7.2) — same policy as the non-crypto path; see
         // `.doc/pdf2-support-plan-2026-11-07.md` Phase A.
         let version = version::detect_version(&data)?;
-        let start = find_startxref_offset(&data)?;
-        let (xref, mut trailer) = build_xref(&data, start)?;
+        let (xref, mut trailer) = recovery::load_xref(&data, find_startxref_offset(&data).ok())?;
 
         // /Encrypt is often stored as an indirect reference (e.g. `5 0 R`) rather
         // than an inline dict. Resolve it now so from_trailer always sees a dict.
@@ -984,8 +986,7 @@ fn apply_predictor(mut data: Vec<u8>, parms: &PdfDict) -> Result<Vec<u8>> {
 /// Cheaply detect if `data` is an encrypted PDF.
 /// Only parses the XRef trailer — no objects are loaded or decrypted.
 pub fn has_encryption_trailer(data: &[u8]) -> Result<bool> {
-    let start = find_startxref_offset(data)?;
-    let (_xref, trailer) = build_xref(data, start)?;
+    let (_xref, trailer) = recovery::load_xref(data, find_startxref_offset(data).ok())?;
     Ok(trailer.contains_key("Encrypt"))
 }
 
