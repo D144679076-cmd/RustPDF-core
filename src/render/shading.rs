@@ -1,15 +1,23 @@
 //! PDF Shading (gradient) rasteriser — ISO 32000-1 §8.7.
 //!
-//! Implements ShadingType 2 (axial) and ShadingType 3 (radial), which cover
-//! the vast majority of gradients produced by PowerPoint / LibreOffice exports.
-//! Function types 2 (Exponential) and 3 (Stitching) are supported; type 0
-//! (sampled) is not yet implemented.
+//! ShadingTypes implemented here: 2 (axial) and 3 (radial) inline; mesh types
+//! (4 free-form / 5 lattice) via `mesh`, function-based type 1 via
+//! `function_shaded`, with the FunctionType 4 PostScript evaluator in `ps`.
+//! Function types 2 (Exponential) and 3 (Stitching) supported for the
+//! 1-input axial/radial path; Type 0 (sampled) is not yet implemented.
 
 use crate::content::graphics_state::Matrix;
 use crate::error::{PdfError, Result};
 use crate::parser::objects::{PdfDict, PdfDocument, PdfObject};
 
 use super::canvas::PixmapBuffer;
+
+mod function_shaded;
+mod mesh;
+mod ps;
+
+pub use function_shaded::FunctionShading;
+pub use mesh::MeshShading;
 
 // ---------------------------------------------------------------------------
 // Shading function
@@ -27,25 +35,43 @@ pub enum ShadingFunction {
         functions: Vec<ShadingFunction>,
         domain: [f64; 2],
     },
+    /// Type 4 — PostScript calculator, 2-input entry (`eval2`). Used by
+    /// function-based (Type 1) shadings and mesh /Function overrides.
+    PostScript {
+        /// Decoded program body.
+        body: Vec<u8>,
+        /// The function's own /Domain `[x0 x1 y0 y1]`.
+        ps_domain: [f64; 4],
+    },
 }
 
 impl ShadingFunction {
-    /// Parse a PDF Function object.
+    /// Parse a PDF Function object (dictionary or stream).
+    ///
+    /// Type 4 (PostScript) functions carry their program in the stream
+    /// contents — decoded here; the other function types need only the dict.
     pub fn parse(obj: &PdfObject, doc: &PdfDocument) -> Result<Self> {
-        let dict = match doc.resolve(obj)? {
-            PdfObject::Dictionary(d) => d,
-            PdfObject::Stream(s) => s.dict.clone(),
-            other => {
-                return Err(PdfError::invalid_token(
-                    0,
-                    format!("expected function dict, got {:?}", other),
-                ))
+        match obj {
+            PdfObject::Reference(..) => {
+                let resolved = doc.resolve(obj)?;
+                Self::parse(&resolved, doc)
             }
-        };
-        Self::parse_dict(&dict, doc)
+            PdfObject::Stream(s) => {
+                let dict = s.dict.clone();
+                let body = s.decode().map_err(|e| {
+                    PdfError::invalid_token(0, format!("function stream decode failed: {}", e))
+                })?;
+                Self::parse_dict(&dict, doc, Some(body))
+            }
+            PdfObject::Dictionary(d) => Self::parse_dict(d, doc, None),
+            other => Err(PdfError::invalid_token(
+                0,
+                format!("expected function dict, got {:?}", other),
+            )),
+        }
     }
 
-    fn parse_dict(dict: &PdfDict, doc: &PdfDocument) -> Result<Self> {
+    fn parse_dict(dict: &PdfDict, doc: &PdfDocument, ps_body: Option<Vec<u8>>) -> Result<Self> {
         let fn_type = dict.get("FunctionType").and_then(pdf_int).unwrap_or(2);
 
         match fn_type {
@@ -82,6 +108,22 @@ impl ShadingFunction {
                     functions,
                     domain,
                 })
+            }
+            4 => {
+                let body = ps_body.ok_or_else(|| {
+                    PdfError::invalid_token(0, "FunctionType 4 requires its stream contents")
+                })?;
+                // /Domain for a 2-input function is [xlo xhi ylo yhi]; the
+                // *mapping* into [0,1] happens inside ps::eval2.
+                let dom_arr =
+                    dict_f64_array(dict, "Domain").unwrap_or_else(|| vec![0.0, 1.0, 0.0, 1.0]);
+                let ps_domain = [
+                    *dom_arr.first().unwrap_or(&0.0),
+                    *dom_arr.get(1).unwrap_or(&1.0),
+                    *dom_arr.get(2).unwrap_or(&0.0),
+                    *dom_arr.get(3).unwrap_or(&1.0),
+                ];
+                Ok(ShadingFunction::PostScript { body, ps_domain })
             }
             other => {
                 // Unsupported — return identity grey function so rendering doesn't crash.
@@ -148,6 +190,24 @@ impl ShadingFunction {
 
                 functions[idx].eval(t_local)
             }
+            ShadingFunction::PostScript { .. } => {
+                // 1-input eval is meaningless for the 2-input PostScript
+                // calculator; renderers route through `eval2`. Return a flat
+                // grey so axial/radial callers that somehow attach one don't
+                // crash.
+                log::warn!("1-input eval on PostScript function; using grey");
+                vec![0.5]
+            }
+        }
+    }
+
+    /// Evaluate the 2-input function at `(t0, t1)` — PostScript variant only.
+    ///
+    /// Used by function-based shadings (Type 1) and mesh /Function overrides.
+    pub fn eval2(&self, t0: f64, t1: f64) -> std::result::Result<Vec<f64>, String> {
+        match self {
+            ShadingFunction::PostScript { body, ps_domain } => ps::eval2(body, t0, t1, *ps_domain),
+            _ => Err("eval2 requires a FunctionType 4 (PostScript) function".to_string()),
         }
     }
 }
@@ -195,11 +255,38 @@ pub struct RadialShading {
 pub enum Shading {
     Axial(AxialShading),
     Radial(RadialShading),
+    /// ShadingType 1 — per-pixel 2-input function (see `function_shaded.rs`).
+    FunctionBased(FunctionShading),
+    /// ShadingType 4/5 — Gouraud meshes (see `mesh.rs`); 6/7 deferred.
+    Mesh(MeshShading),
 }
 
 impl Shading {
-    /// Parse a PDF Shading dictionary.
-    pub fn parse(dict: &PdfDict, doc: &PdfDocument) -> Result<Self> {
+    /// Parse a PDF Shading object — the Shading resource value (dictionary)
+    /// or an indirect stream (Types 4–7 or any stream-backed shading).
+    pub fn parse(obj: &PdfObject, doc: &PdfDocument) -> Result<Self> {
+        match obj {
+            PdfObject::Reference(..) => {
+                let resolved = doc.resolve(obj)?;
+                Self::parse(&resolved, doc)
+            }
+            PdfObject::Stream(s) => {
+                let data = s.decode().map_err(|e| {
+                    PdfError::invalid_token(0, format!("shading stream decode failed: {}", e))
+                })?;
+                Self::parse_shading_dict(&s.dict, doc, data)
+            }
+            PdfObject::Dictionary(d) => Self::parse_shading_dict(d, doc, Vec::new()),
+            other => Err(PdfError::invalid_token(
+                0,
+                format!("expected shading dict or stream, got {:?}", other),
+            )),
+        }
+    }
+
+    /// Parse the shading fields given the (fully decoded) stream payload for
+    /// mesh types, or empty bytes for dict-only shadings.
+    fn parse_shading_dict(dict: &PdfDict, doc: &PdfDocument, data: Vec<u8>) -> Result<Self> {
         let shading_type = dict.get("ShadingType").and_then(pdf_int).unwrap_or(0);
 
         let domain = {
@@ -251,8 +338,7 @@ impl Shading {
             }
             3 => {
                 let coords = dict_f64_array(dict, "Coords")
-                    .ok_or_else(|| PdfError::invalid_token(0, "radial shading missing /Coords"))?;
-                if coords.len() < 6 {
+                    .ok_or_else(|| PdfError::invalid_token(0, "radial shading missing /Coords"))?;                if coords.len() < 6 {
                     return Err(PdfError::invalid_token(
                         0,
                         "radial shading Coords needs 6 values",
@@ -271,9 +357,27 @@ impl Shading {
                     n_components,
                 }))
             }
+            1 => Ok(Shading::FunctionBased(FunctionShading::parse(
+                dict, function, n_components,
+            )?)),            4 | 5 => {
+                if data.is_empty() {
+                    return Err(PdfError::invalid_token(
+                        0,
+                        "mesh shading (types 4–7) requires a stream object with data",
+                    ));
+                }
+                Ok(Shading::Mesh(mesh::parse(
+                    dict,
+                    &data,
+                    shading_type as u32,
+                )?))
+            }
             other => Err(PdfError::invalid_token(
                 0,
-                format!("unsupported ShadingType {}", other),
+                format!(
+                    "unsupported ShadingType {} (types 1–5 supported; 0 sampled, 6 Coons / 7 tensor deferred)",
+                    other
+                ),
             )),
         }
     }
@@ -283,6 +387,8 @@ impl Shading {
         match self {
             Shading::Axial(s) => rasterize_axial(s, ctm, canvas),
             Shading::Radial(s) => rasterize_radial(s, ctm, canvas),
+            Shading::FunctionBased(s) => s.rasterize(ctm, canvas),
+            Shading::Mesh(m) => m.rasterize(ctm, canvas),
         }
     }
 }
@@ -292,7 +398,7 @@ impl Shading {
 // ---------------------------------------------------------------------------
 
 /// Compute the inverse of a 2D affine matrix [a b c d e f].
-fn inverse_matrix(m: &Matrix) -> Option<Matrix> {
+pub(crate) fn inverse_matrix(m: &Matrix) -> Option<Matrix> {
     let det = m.a * m.d - m.b * m.c;
     if det.abs() < 1e-10 {
         return None;
@@ -308,7 +414,7 @@ fn inverse_matrix(m: &Matrix) -> Option<Matrix> {
 }
 
 /// Convert shading color components to RGBA bytes.
-fn components_to_rgba(comps: &[f64], n: usize) -> [u8; 4] {
+pub(crate) fn components_to_rgba(comps: &[f64], n: usize) -> [u8; 4] {
     let to_u8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0) as u8;
     match n {
         1 => {
@@ -600,7 +706,7 @@ fn dict_f64_array(dict: &PdfDict, key: &str) -> Option<Vec<f64>> {
     }
 }
 
-fn cs_n_components(cs_obj: Option<&PdfObject>) -> usize {
+pub(crate) fn cs_n_components(cs_obj: Option<&PdfObject>) -> usize {
     match cs_obj {
         Some(PdfObject::Name(n)) => match n.as_str() {
             "DeviceGray" | "CalGray" => 1,

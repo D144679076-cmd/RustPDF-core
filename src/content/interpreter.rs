@@ -77,10 +77,13 @@ pub trait OutputDevice {
     }
 
     /// Called for the `sh` shading operator.
+    ///
+    /// `shading` is the resolved Shading resource value — a dictionary for
+    /// axial/radial/function-based shadings, or a stream for mesh types.
     /// Default is a no-op so non-rendering devices (TextExtractor) need no change.
     fn paint_shading(
         &mut self,
-        _shading_dict: &crate::parser::objects::PdfDict,
+        _shading: &PdfObject,
         _doc: &crate::parser::objects::PdfDocument,
         _state: &GraphicsState,
     ) {
@@ -553,13 +556,10 @@ impl ContentInterpreter {
                         };
                         if let Some(ref shading_ref) = shading_dict_obj {
                             let resolved = doc_ref.resolve(shading_ref).unwrap_or(PdfObject::Null);
-                            let shading_dict = match resolved {
-                                PdfObject::Dictionary(d) => Some(d),
-                                PdfObject::Stream(s) => Some(s.dict.clone()),
-                                _ => None,
-                            };
-                            if let Some(d) = shading_dict {
-                                device.paint_shading(&d, doc_ref, &self.gfx.current);
+                            if matches!(resolved, PdfObject::Dictionary(_))
+                                || matches!(resolved, PdfObject::Stream(_))
+                            {
+                                device.paint_shading(&resolved, doc_ref, &self.gfx.current);
                             }
                         }
                     }

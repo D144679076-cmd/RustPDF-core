@@ -906,11 +906,11 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
 
     fn paint_shading(
         &mut self,
-        shading_dict: &crate::parser::objects::PdfDict,
+        shading: &crate::parser::objects::PdfObject,
         doc: &crate::parser::objects::PdfDocument,
         state: &GraphicsState,
     ) {
-        match Shading::parse(shading_dict, doc) {
+        match Shading::parse(shading, doc) {
             Ok(shading) => shading.rasterize(&state.ctm, &mut self.canvas),
             Err(e) => log::warn!("shading parse error: {}", e),
         }
@@ -1412,24 +1412,37 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
-        // Extract the Shading sub-dict
-        let shading_dict = match pat_dict.get("Shading") {
-            Some(PdfObject::Dictionary(d)) => d.clone(),
-            Some(other) => {
-                if let Ok(PdfObject::Dictionary(d)) = self.doc.resolve(other) {
-                    d
-                } else {
-                    log::warn!("cannot resolve Shading in pattern '{}'", pattern_name);
-                    return;
-                }
-            }
+        let resolved_obj = match pat_dict.get("Shading") {
+            Some(other) => self.doc.resolve(other),
             None => {
                 log::warn!("no Shading entry in pattern '{}'", pattern_name);
                 return;
             }
         };
 
-        let shading = match Shading::parse(&shading_dict, self.doc) {
+        let shading_obj = match resolved_obj {
+            Err(e) => {
+                log::warn!(
+                    "cannot resolve Shading in pattern '{}': {}",
+                    pattern_name,
+                    e
+                );
+                return;
+            }
+            Ok(o) => match o {
+                PdfObject::Dictionary(_) | PdfObject::Stream(_) => o,
+                other => {
+                    log::warn!(
+                        "unsupported Shading value in pattern '{}' {:?}",
+                        pattern_name,
+                        other
+                    );
+                    return;
+                }
+            },
+        };
+
+        let shading = match Shading::parse(&shading_obj, self.doc) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("shading parse error in pattern '{}': {}", pattern_name, e);
