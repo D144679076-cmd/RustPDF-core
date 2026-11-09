@@ -105,3 +105,29 @@ python3 tests/gen_fixtures.py
 ```
 
 This produces valid PDFs with correct byte offsets in the XRef table.
+
+## Render Snapshot Comparisons (`tests/snapshot.rs`)
+
+Full-page renders are compared against MuPDF reference images — golden-master
+style. Requires `mutool` (apt: `mupdf-tools`); references are **not** committed
+(≈84 MB uncompressed) and are regenerated locally:
+
+```bash
+tests/gen_snapshot_refs.sh                      # every fixture PDF
+tests/gen_snapshot_refs.sh tests/fixtures/minimal.pdf   # one PDF
+cargo test --test snapshot --features render -- --nocapture
+```
+
+How it works:
+- MuPDF writes `tests/fixtures/ref/<stem>-<N>.ppm` (72 DPI, P6, pages 1-based).
+- The harness renders each page with `render_page_rgba(..., 1.0)` (also 72 DPI)
+  and compares RGB channels (alpha ignored).
+- Bars: per-pixel channel delta ≤ 16, divergent pixels ≤ 25%, mean Δ ≤ 16.
+  Calibrated on the 2026-11-09 baseline (mean ≤ 10.6 / divergent ≤ 12.9%
+  across 60 pages — differences are anti-aliased glyph/vector edges).
+- Pages without a reference are skipped and counted, so the harness passes
+  before `gen_snapshot_refs.sh` has been run, but asserts ≥ 1 compared page.
+
+License note: references are MuPDF *output images*, not MuPDF code — no AGPL
+code is linked or distributed; see `.doc/render-snapshot-harness-2026-11-09.md`.
+

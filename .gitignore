@@ -21,3 +21,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 test_output/
+
+# MuPDF reference renders (84 MB; regenerate with tests/gen_snapshot_refs.sh)
+tests/fixtures/ref/
