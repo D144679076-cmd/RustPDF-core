@@ -15,10 +15,17 @@
 //!     println!("{}: valid={}", result.field_name, result.signature_valid);
 //! }
 //! ```
+//!
+//! ## Long-term validation material
+//! `dss::parse_dss` exposes the Document Security Store (`Catalog /DSS`,
+//! ISO 32000-2 §12.8.4) — pooled certs/OCSP/CRLs + per-signature `/VRI` —
+//! read-only, lazily resolved.
 
 pub(crate) mod cms;
+pub mod dss;
 pub mod signer;
 pub mod verifier;
 
+pub use dss::{parse_dss, DocumentSecurityStore, DssItem, DssPayload, VriInfo};
 pub use signer::{sign_document, SignatureOptions};
 pub use verifier::{verify_signatures, SignatureVerification};

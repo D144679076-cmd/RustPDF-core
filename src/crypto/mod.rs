@@ -8,6 +8,7 @@
 
 pub mod aes256;
 pub mod handler;
+pub mod password;
 pub mod rc4;
 
 pub use handler::EncryptionHandler;

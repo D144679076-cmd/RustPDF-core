@@ -95,7 +95,7 @@ warning and skip — they never panic.
 - JavaScript (`/JS` actions) — security risk, never implement
 - 3D annotations (U3D/PRC) — out of scope
 - Rich media (Flash/video) — out of scope
-- PDF 2.0 new operators — defer until xpdf itself adds them
+- PDF 2.0 — see `.doc/pdf2-support-plan-2026-11-07.md` (research correction: PDF 2.0 adds **no new content operators**; real changes are encryption, text strings, Associated Files, DSS/LTV — phases A–F shipped 2026-11, reports in `.doc/pdf2-phase-{a..f}-2026-11-07.md`; OCSP/CRL *validation* remains deferred)
 
 ### 1.5 Font Handling
 - **Standard 14 fonts**: must be embedded as fallback data (already in C++

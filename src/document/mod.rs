@@ -6,6 +6,7 @@
 //! - [`outline`] — bookmark/outline tree (read)
 //! - [`outline_writer`] — bookmark/outline tree (write, `writer` feature)
 
+pub mod associated_files;
 pub mod catalog;
 pub mod metadata;
 pub mod name_tree;

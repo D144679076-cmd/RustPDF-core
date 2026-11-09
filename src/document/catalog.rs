@@ -255,6 +255,17 @@ impl Catalog {
     pub fn struct_tree(&self, doc: &PdfDocument) -> Result<Option<StructNode>> {
         super::structure::parse_struct_tree(doc, &self.dict)
     }
+
+    /// Parse the document-level associated files from the catalog's `/AF`
+    /// entry (ISO 32000-2 §7.11.3).
+    ///
+    /// Returns an empty vec when `/AF` is absent.
+    pub fn associated_files(
+        &self,
+        doc: &PdfDocument,
+    ) -> Result<Vec<super::associated_files::FileSpec>> {
+        super::associated_files::catalog_associated_files(doc, &self.dict)
+    }
 }
 
 /// Iteratively collect each leaf /Page's *reference* (or inline dict) in

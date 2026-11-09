@@ -58,6 +58,14 @@ pub enum PdfError {
         offset: usize,
     },
 
+    /// The PDF file header is missing or malformed (`%PDF-m.n` scan, §7.2).
+    #[error("Missing or malformed PDF header near byte offset {offset}")]
+    Header {
+        /// Byte offset of the error: 0 when no `%PDF-` marker exists in the
+        /// scan window, else the offset of the corrupt marker.
+        offset: usize,
+    },
+
     /// A serialization or write operation failed.
     #[error("Write error: {message}")]
     WriteError {

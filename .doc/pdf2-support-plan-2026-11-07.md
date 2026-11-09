@@ -1,0 +1,212 @@
+# PDF 2.0 Support Plan — Research + Implementation Plan
+
+**Date:** 2026-11-07
+**Scope:** PDF 2.0 (ISO 32000-2) reader/writer support — feature previously marked ❌ (planned) in `REBUILD_PLAN.md:98` and `docs/competitive-feature-report-2026-11-07.md:18`
+
+## Progress (as of 2026-11-09)
+
+| Phase | Status | Report |
+|-------|--------|--------|
+| A — version model + header tolerance | ✅ done | `.doc/pdf2-phase-a-2026-11-07.md` |
+| B — Unicode R6 passwords + RC4 policy gate | ✅ done | `.doc/pdf2-phase-b-2026-11-07.md` |
+| C — Associated Files read + write | ✅ done | `.doc/pdf2-phase-c-2026-11-07.md` |
+| D — DSS/LTV read-only | ✅ done | `.doc/pdf2-phase-d-2026-11-07.md` |
+| E — writer PDF 2.0 opt-in | ✅ done | `.doc/pdf2-phase-e-2026-11-07.md` |
+| F — fixtures + docs | ✅ done (2026-11-09) | `.doc/pdf2-phase-f-2026-11-09.md` |
+
+Deviation in F: `pdf2-encrypted-r6.pdf` fixture deferred — the writer cannot
+produce R6-encrypted output yet (plan §7 keeps write-side encryption as a
+follow-up); R6 + Unicode-password *reading* is covered by crafted-bytes unit
+tests in `src/crypto` (Phase B reports).
+
+---
+
+## 1. What Is PDF 2.0?
+
+PDF 2.0 is **ISO 32000-2**, first published **2017** (2nd edition **2020**, corrigendum **2023**). It is the first PDF version whose specification is owned and maintained solely by ISO (PDF 1.7 = ISO 32000-1 was a snapshot of Adobe's own spec). The file header changes to `%PDF-2.0`; conforming files declare `/Version 2.0` in the catalog.
+
+Purpose of PDF 2.0:
+
+1. **Clean up** — remove/deprecate proprietary, obsolete, and Adobe-only baggage from PDF 1.7.
+2. **Complete the spec** — fold previously Adobe-extension features (e.g. digital signature LTV/DSS) into the normative base.
+3. **Improve interoperability** — tighten underspecified areas (Associated Files, file specifications, signature cre­dentials) so independent implementations interoperate without the Adobe reference.
+
+**Important correction to the old deferral note** (`REBUILD_PLAN.md:98`):
+"PDF 2.0 new operators — defer until xpdf itself adds them". Research shows
+**PDF 2.0 adds no new page-content operators.** The content-stream operator set
+(text, path, color, XObjects, marked content…) is unchanged from PDF 1.7.
+What changed is dictionaries, encryption, strings, and signatures — all of which
+live in our parser/document/crypto/signatures layers, not the render
+interpreter. That means "Parse PDF 2.0" is a **parsing + document-model + crypto
+task**; the renderer needs zero changes.
+
+---
+
+## 2. PDF 2.0 vs PDF 1.x — Feature-by-Feature Difference
+
+### 2.1 What is genuinely NEW (reader must parse)
+
+| Feature | Detail | ISO ref | Reader impact |
+|---------|--------|---------|---------------|
+| **Unicode passwords** | Password strings may be UTF-8; normalized (SASLprep-ish conversion: UTF-8 password → PDFDocEncoding fallback / UTF-8→ULS mapping) before key derivation. R6 now the normative cipher. | §7.6.4.3.2 | `crypto` — password normalization; we already implement Algorithm 2.B R6 |
+| **UTF-8 text strings** | All text strings may use UTF-8 with BOM `EF BB BF` (alongside UTF-16BE `FE FF` and PDFDocEncoding). | §7.9.2.2 | `document/text_string.rs` already decodes UTF-8 BOM ✅ |
+| **Associated Files (AF)** | `/AF` array of file-spec dicts at **document level** (Catalog) and **page level**; `/AFRelationship` = `Source`/`Data`/`Supplement`/`EncryptedPayload`/`FormData`/`Schema`/`Unspecified`; `/UF` (Unicode filename) now **required** on file specs; tightened `/EmbeddedFile` `/Params` semantics. | §7.11.3, §7.11.4 | `parser` + `document/catalog.rs` — new dict parsing; writer support |
+| **DSS / LTV signatures (Document Security Store)** | Long-term validation — `/DSS` dict with `/Certs`, `/OCSPs`, `/CRLs` and per-signature `/VRI` — moved from Adobe extension into normative spec, aligned with PAdES. | §12.8.4 | `signatures/verifier.rs` — parse DSS for revocation info (read-only first) |
+| **Encryption policy** | PDF 2.0 files encrypt with **AES only**. RC4 (40/128-bit, V2/V3) and R5 are removed/deprecated; R6 (AES-256) and R4 (AES-128) survive. | §7.6.4 | crypto already handles R4–R6 (read side). Policy check: a file claiming v2.0 with RC4 = malformed, reject gracefully |
+| **Real-number tolerance** | Readers must accept real numbers of greater precision (1.7 implied ~4 decimal digits in most contexts); core parser already stores `f64`/f32 as appropriate. | §7.3.3 | Lexer unaffected → no work, just confirm no precision loss in number combinator |
+| **Future-version tolerance** | Readers must not reject files because of a newer `/Version` than they know; degrade gracefully, log warn, ignore unknown dict keys. | §7.2 | Version detection module must treat unknown version as warn-not-error |
+
+### 2.2 What was DEPRECATED / REMOVED in PDF 2.0 (reader must still tolerate in v1.x files)
+
+| Removed/Deprecated | Notes for us |
+|--------------------|--------------|
+| **XFA forms** | Deprecated. `forms/reader.rs` and `wasm/editor.rs` already document this and warn ✅. Keep the current deprecation-warn path. |
+| **RC4 / AES-128 with MD5 (R2, R3, R5)** | Keep decrypt for v1.x files (legacy PDFs are everywhere and paid-feature parity demands it); only forbid RC4+2.0-claiming files. |
+| **RichMedia (Flash) / 3D (U3D-PRC) / JavaScript embedding priority** | Consistent with our existing non-goals (`REBUILD_PLAN.md` §1.4): skip with `log::warn!`, never panic. |
+| **Adobe `Extensions` dictionary mechanism** (`/Extensions [<>]`) | Parse and ignore; version knowledge must come from catalog `/Version`, not vendor-specific dicts. |
+
+### 2.3 What PDF 2.0 did NOT change (explicitly, to close the deferral)
+
+- **No new content-stream operators** — full operator table from `REBUILD_PLAN.md` §1.4 remains complete and valid for PDF 2.0 documents.
+- No new filters (WillDecode set unchanged: Flate, LZW, ASCIIHex, ASCII85, DCT, JBIG2, JPX, RunLength, Crypt). JPX/JBIG2 remain *optional* for readers — for us they stay deferred exactly as in §1.10/§1.5 of the rebuild plan (JPEG2000).
+- No change to XRef streams / object streams (already PDF 1.5, done in `parser/xref.rs`).
+- Transparency model (already 1.4), ICC color spaces, tagged-PDF structure model — carried over into 32000-2 essentially unchanged.
+
+Baseline in PDF 1.5–1.7 that we already support and that PDF 2.0 files reuse: object streams, xref streams, AES-128, cross-reference `/Encrypt` exceptions.
+
+---
+
+## 3. Current-State Audit (what the codebase already does)
+
+| PDF 2.0 item | Status | Evidence |
+|--------------|--------|----------|
+| AES-256 R6 key derivation / verify | ✅ done | `src/crypto/aes256.rs` (`derive_file_key_r6`, `verify_user_password_r6` — Algorithm 2.B), `src/crypto/handler.rs` |
+| UTF-8 BOM text strings | ✅ done | `src/document/text_string.rs` |
+| XFA deprecation awareness | ✅ done | `src/forms/reader.rs:112`, `src/wasm/editor.rs:1157` |
+| RC4 / AES-128 legacy decrypt | ✅ done | `src/crypto/rc4.rs` |
+| Version header detection (`%PDF-2.0`) | ❌ absent — parser tolerates versioned headers only implicitly; no `PdfVersion` model, no future-version tolerance policy | parser module (`xref.rs`, `objects.rs` has no header scan) |
+| Unicode password normalization for R6 | ❌ absent — passwords treated as raw bytes only |
+| Associated Files `/AF`, `/AFRelationship`, `/UF` | ❌ absent — no matches anywhere in `src/` |
+| DSS / LTV parsing | ❌ absent — `signatures/{cms,verifier}.rs` handle CMS/PKCS#7 only |
+| Writer emits `/Version 2.0`, UTF-8 strings, `/AF` | ❌ absent — `writer/serializer.rs` is 1.x-only |
+| UTF-16 `/UF` filename / file-spec model | ❌ absent |
+
+---
+
+## 4. Implementation Plan (step-by-step)
+
+Order: cheapest correctness wins first, then features, then writer + fixtures.
+All phases obey house rules R1–R12 (`AGENTS.md`): `Result`-only public API, byte-offset errors, happy+error tests per `parse_*`, WASM check, doc comments, `.doc/` report per phase.
+
+### Phase A — Version model + header tolerance  *(1 day)*
+
+**Files:** `src/parser/mod.rs` (new `version.rs`), `src/parser/xref.rs` (touchpoint only)
+
+- New `PdfVersion` enum: `V1_0..V1_7, V2_0, Unknown(u16, u16)` — parse from `%PDF-m.n` header (scan first 1024 bytes, tolerate offsets and a leading binary-comment line per spec §7.2).
+- `Document::version() -> PdfVersion` exposed publicly; error variants carry byte `offset` (R7).
+- **Tolerance policy (spec §7.2 / future compatibility):** unknown versions → `log::warn!` + parse anyway; only malformed header *bytes* are `Err(PdfError::Header { offset })`.
+- Tests (R5): happy `1.4/1.7/2.0` crafted bytes; error-path: missing header, bad digits, garbage; unknown version `2.7` → Ok + warn.
+
+### Dual-version handling policy (applies to all phases)
+
+Every PDF 2.0 feature is version-gated at the document level, never assumed:
+
+| Case | Behavior |
+|------|----------|
+| v1.x file using PDF 2.0 features (e.g. `/AF`, UTF-8 BOM strings, R6) | Parse extension-style: warn + accept — real PDFs mix versions freely (Acrobat extension files already did). Never reject for "feature too new". |
+| v2.0 file using removed features (RC4, missing `/UF`) | Graceful degradation: RC4+2.0 = `Err(PdfError::Encryption { offset })`; missing `/UF` falls back to `/F` + warn. |
+| Header version vs Catalog `/Version` conflict | Header version wins for encryption policy; catalog version reported as-is; warn on mismatch. |
+| Incremental-update documents (1.x base + later updates) | Version = base file version from Phase A; each update parsed independently; features never threshold-switched mid-document. |
+| Future version 2.x/3.0 | `PdfVersion::Unknown` → `log::warn!` + parse anyway (spec §7.2 tolerance). |
+
+Unit tests required per row (R5) — same crafted-bytes pattern, one Fix feature matrix test per version.
+
+### Phase B — Unicode passwords for R6 encryption  *(1 day)*
+
+**Files:** `src/crypto/aes256.rs`, `src/crypto/handler.rs`
+
+- Add `normalize_password(raw: &[u8]) -> Result<Vec<u8>>` implementing ISO 32000-2 §7.6.4.3.2 conversion (UTF-8 password → SASLprep-like mapping → fallback UTF-16 raw string).
+- Wire into R6 password-verify path before Algorithm 2.B; keep raw-bytes path for legacy R4/R5 to avoid v1.x regressions (behind a version check from Phase A).
+- Tests: crafted `/Encrypt` with R6, UTF-8 password → verify Ok; wrong password → Err with offset; legacy RC4 doc → still Ok (regression guard).
+
+### Phase C — Associated Files (FileSpec v2, `/AF`)  *(2–3 days)*
+
+**Files:** new `src/document/asscociated_files.rs` → spelled `src/document/associated_files.rs`, plus `src/document/catalog.rs`, `src/document/page.rs`, `src/writer/document.rs`
+
+Reader:
+- `FileSpec` model: `/F` (ASCII name), **`/UF`** (Unicode name, required in PDF 2.0), `/Desc`, `/AFRelationship` (enum + `Unspecified` default), `/EF → /EmbeddedFile` stream (stream `/Type`, `/Params` incl. `/CreationDate`, `/ModDate`, `/Size`, `/CheckSum`).
+- Parse Catalog `/AF` and per-page `/AF`; resolve indirect refs through existing object model.
+- Unknown `AFRelationship` value → `Unspecified` + warn (never error).
+- Public `Document::associated_files() -> Vec<FileSpec>`; `was_encrypted` stream decrypt honored if `/EmbeddedFile` is encrypted.
+
+Writer:
+- `DocumentBuilder::add_associated_file(rel, name, mime?, bytes)` emitting `/AF` + `/EF` with `/UF` always present.
+- Preserve unknown `/AF` entries on incremental updates (writer must not drop foreign dicts it does not understand — flag as follow-up if scope grows too much).
+
+Tests: reader salut — crafted bytes with document-level and page-level AF chains incl. indirect-ref chains and unknown relationship enum; writer test — add AF, round-trip read-back lists same entries.
+
+### Phase D — DSS / LTV signature envelope (read-only)  *(1–2 days)*
+
+**Files:** `src/signatures/verifier.rs`, new `src/signatures/dss.rs`
+
+- Parse `Catalog /DSS` → `{ /Certs [], /OCSPs [], /CRLs [] }` (DER streams) and `/VRI` sub-dicts keyed by signature-hash; expose typed `DssInfo` (read-only — no PKI *validation* of OCSP/CRL entirely this phase; validation lives in existing `signatures/verifier.rs` core, extended in follow-up).
+- Hand data to existing CMS verifier as optional revocation material.
+- Future-version tolerance: ignore unknown keys (log), never fail the open path because of a DSS we can't parse.
+- Tests: crafted catalog with DSS + VRI (happy), malformed DSS (error-path with offset), doc without DSS → empty result.
+
+### Phase E — Writer PDF 2.0 opt-in  *(1 day, afterането C)*
+
+**Files:** `src/writer/serializer.rs`, `src/writer/document.rs`
+
+- `EmitVersion::V1_7 (default) | V2_0` option on the writer:
+  header `%PDF-2.0`, catalog `/Version 2.0`, always emit `/UF` next to `/F` on every file spec, emit UTF-8 BOM strings where the string bank is Unicode.
+- Keep RC4 out of the 2.0 path entirely (assert/return Err if someone combines v2.0 + RC4).
+- Round-trip test: write 2.0 doc → read with our reader → version == V2_0 and AF + strings round-trip.
+
+### Phase F — Fixtures, CI, docs  *(0.5–1 day)*
+
+**Files:** `tests/fixtures/`, `docs/`, `REBUILD_PLAN.md`, `docs/competitive-feature-report-2026-11-07.md`
+
+- Add fixtures (R6): `pdf2-minimal.pdf` (v2.0 header, UTF-8 strings, one page), `pdf2-associated-files.pdf` (/AF + /UF + AFRelationship), `pdf2-encrypted-r6.pdf` (R6 + UTF-8 password), `pdf2-signed-ltv.pdf` (CMS + DSS) — generated by our own writer + a tiny Python script committed under `scripts/` for reproducibility.
+- CI run: `cargo test`, `cargo clippy -- -D warnings`, `cargo build --target wasm32-unknown-unknown`.
+- Replace `REBUILD_PLAN.md:98` deferral note with pointer to this plan; update the competitive report row from ❌ to ✅ (keep 🟡 only for OCSP/CRL *validation*, which stays a follow-up).
+
+---
+
+## 5. Risks & Mitigations
+
+| Risk | L | Mitigation |
+|------|---|------------|
+| Old deferral note was wrong about "new operators" | done | Verified in research §1: no new operators; plan targets dictionaries/crypto instead |
+| UTF-8 password normalization edge cases (SASLprep) | M | Restrict to spec-required subset (UTF-8 → password conversion) with UTF-16 fallback; unit tests for ASCII, non-ASCII, empty |
+| `/AF` on encrypted EmbeddedFiles double-decode | M | Reuse existing encrypted-stream path in `crypto/handler.rs`; regression test with encrypted AF |
+| DSS size on real signed docs (MBs of CRLs) | M | Read-only, lazy-resolve streams; do not inflate into memory unless requested |
+| Writer drops foreign dicts (AF etc.) on incremental update | M | Mark unknown-preservation as explicit follow-up; round-trip tests catch regressions before merge |
+| Scope creep into OCSP/CRL full validation | H | Explicit non-goal for this plan: read-only DSS parse; validation = separate phase |
+
+---
+
+## 6. Verification Plan
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+cargo build --target wasm32-unknown-unknown
+```
+
+Feature-specific acceptance:
+1. `PdfDocument::from_bytes(pdf2-*fixture)` — version = V2_0, no panic on unknown-version `2.7` crafted file (warn only).
+2. `associated_files()` returns `/UF` Unicode names and `/AFRelationship` for the AF fixture.
+3. R6 fixture opens with UTF-8 password; wrong password → `Err(PdfError::Encryption)` with offset (R7, R1).
+4. Signed-LTV fixture → `dss()` exposes pooled certs/OCSP/CRLs; bytes round-trip through CMS verifier untouched.
+5. Writer emits a `%PDF-2.0` document that **our own reader** parses, and `/UF` is present on every file spec.
+
+---
+
+## 7. Known Limitations / Follow-up (deferred deliberately)
+
+- OCSP/CRL cryptographic **validation** (real revocation status checking) — separate phase, needs `webpki`/`x509` depth already deferred in the original plan §1.7.
+- JPXDecode / JBIG2Decode rendering — unchanged deferral (`REBUILD_PLAN.md` §1.4, §1.10); PDF 2.0 keeps them optional, so PDF 2.0 **reading** is never blocked by this.
+- Full PAdES conformance profiles (B-T, B-LT) — we parse DSS; emitting PAdES-compliant updates is follow-up.
+- PDF 2.0 writer-side Unicode password *setting* (creating R6 dicts with UTF-8 passwords) — read side first, write side second.

@@ -15,7 +15,7 @@ pub mod streams;
 pub mod xref;
 
 pub use content_builder::{ContentBuilder, TjItem};
-pub use document::PdfWriter;
+pub use document::{EmitVersion, PdfWriter};
 pub use font::{write_standard_font, write_truetype_font};
 pub use font_subset::{embed_cidfont_for_chars, EmbeddedCidFont};
 pub use image::{write_image_xobject, write_jpeg_xobject, ImageColorSpace, ImageData};

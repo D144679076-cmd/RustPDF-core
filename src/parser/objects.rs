@@ -14,6 +14,7 @@ use indexmap::IndexMap;
 use crate::error::{PdfError, Result};
 use crate::parser::filters;
 use crate::parser::lexer::{Keyword, Lexer, Token};
+use crate::parser::version;
 
 // ---------------------------------------------------------------------------
 // Public object types
@@ -205,6 +206,9 @@ enum XRefEntry {
 /// retrieve and resolve any object by its object number.
 pub struct PdfDocument {
     data: Vec<u8>,
+    /// Version parsed from the `%PDF-m.n` header (§7.2). Unknown future
+    /// versions still parse (warn + continue); see `parser::version`.
+    pub version: crate::parser::version::PdfVersion,
     xref: HashMap<u32, XRefEntry>,
     /// The most-recent trailer dictionary (combines all incremental-update trailers).
     pub trailer: PdfDict,
@@ -241,6 +245,7 @@ impl Clone for PdfDocument {
     fn clone(&self) -> Self {
         PdfDocument {
             data: self.data.clone(),
+            version: self.version,
             xref: self.xref.clone(),
             trailer: self.trailer.clone(),
             obj_stream_cache: RwLock::new(self.obj_stream_cache.read().clone()),
@@ -268,6 +273,10 @@ impl PdfDocument {
 
         #[cfg(not(feature = "crypto"))]
         {
+            // Header scan first (§7.2) — errors are cheap and early; the
+            // version gates downstream encryption policy (RC4 forbidden in
+            // PDF 2.0 files) and string decoding.
+            let version = version::detect_version(&data)?;
             let start = find_startxref_offset(&data)?;
             let (xref, trailer) = build_xref(&data, start)?;
             if trailer.contains_key("Encrypt") {
@@ -275,6 +284,7 @@ impl PdfDocument {
             }
             Ok(PdfDocument {
                 data,
+                version,
                 xref,
                 trailer,
                 obj_stream_cache: RwLock::new(HashMap::new()),
@@ -291,6 +301,9 @@ impl PdfDocument {
     /// Returns [`PdfError::Encrypted`] if the password is wrong.
     #[cfg(feature = "crypto")]
     pub fn parse_with_password(data: Vec<u8>, password: &[u8]) -> Result<Self> {
+        // Header scan first (§7.2) — same policy as the non-crypto path; see
+        // `.doc/pdf2-support-plan-2026-11-07.md` Phase A.
+        let version = version::detect_version(&data)?;
         let start = find_startxref_offset(&data)?;
         let (xref, mut trailer) = build_xref(&data, start)?;
 
@@ -308,7 +321,8 @@ impl PdfDocument {
         }
 
         let doc_id = extract_file_id(&trailer);
-        let enc = crate::crypto::EncryptionHandler::from_trailer(&trailer, &doc_id, password)?;
+        let enc =
+            crate::crypto::EncryptionHandler::from_trailer(&trailer, &doc_id, password, version)?;
 
         // Read /P from the Encrypt dict to build the Permissions value.
         let permissions = if enc.is_some() {
@@ -327,6 +341,7 @@ impl PdfDocument {
 
         Ok(PdfDocument {
             data,
+            version,
             xref,
             trailer,
             obj_stream_cache: RwLock::new(HashMap::new()),
@@ -353,6 +368,18 @@ impl PdfDocument {
     #[cfg(feature = "crypto")]
     pub fn permissions(&self) -> Option<crate::crypto::handler::Permissions> {
         self.permissions
+    }
+
+    /// The document's PDF version, as parsed from the `%PDF-m.n` file header
+    /// (ISO 32000-1/32000-2 §7.2).
+    ///
+    /// Unknown future versions are preserved as [`crate::parser::version::PdfVersion::Unknown`]
+    /// rather than rejected — future-version tolerance is a conformance
+    /// requirement. For the catalog `/Version` entry (which may override the
+    /// header for a *file's* feature set in 1.x files) see
+    /// `document::catalog::Catalog::version`.
+    pub fn version(&self) -> crate::parser::version::PdfVersion {
+        self.version
     }
 
     /// Whether the document declares encryption (`/Encrypt` in the trailer).
@@ -1680,7 +1707,7 @@ xref\n\
 trailer\n\
 << /Size 4 /Root 1 0 R >>\n\
 startxref\n\
-190\n\
+186\n\
 %%EOF\n";
 
     #[test]
@@ -1868,6 +1895,48 @@ startxref\n\
         let data = b"no xref here at all";
         let result = find_startxref_offset(data);
         assert!(result.is_err());
+    }
+
+    // --- version header integration (Phase A of PDF 2.0 plan) ---------------
+
+    /// Same MINIMAL_PDF body, header swapped: the round-trip fixtures exercise
+    /// every supported header version through the full parse.
+    fn minimal_pdf_with_header(header: &[u8]) -> Vec<u8> {
+        let mut pdf = header.to_vec();
+        pdf.extend_from_slice(&MINIMAL_PDF[9..]); // skip "%PDF-1.4\n"
+        pdf
+    }
+
+    #[test]
+    fn test_parse_reports_1_4_version() {
+        let doc = PdfDocument::parse(minimal_pdf_with_header(b"%PDF-1.4\n")).unwrap();
+        assert_eq!(doc.version(), crate::parser::version::PdfVersion::V1_4);
+    }
+
+    #[test]
+    fn test_parse_reports_2_0_version() {
+        let doc = PdfDocument::parse(minimal_pdf_with_header(b"%PDF-2.0\n")).unwrap();
+        assert_eq!(doc.version(), crate::parser::version::PdfVersion::V2_0);
+    }
+
+    #[test]
+    fn test_parse_future_version_tolerated() {
+        // ISO 32000-2 §7.2: newer versions warn + parse, never hard-reject.
+        let doc = PdfDocument::parse(minimal_pdf_with_header(b"%PDF-2.7\n")).unwrap();
+        assert_eq!(
+            doc.version(),
+            crate::parser::version::PdfVersion::Unknown(2, 7)
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_header_is_header_error() {
+        let body = &MINIMAL_PDF["%PDF-1.4\n".len()..];
+        let result = PdfDocument::parse(body.to_vec());
+        match result {
+            Err(PdfError::Header { offset }) => assert_eq!(offset, 0),
+            other => panic!("expected Header error: {:#?}", other.map(|_| ())),
+        }
     }
 
     #[test]

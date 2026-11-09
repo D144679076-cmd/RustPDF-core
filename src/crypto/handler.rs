@@ -7,6 +7,7 @@ use md5::{Digest, Md5};
 
 use crate::error::{PdfError, Result};
 use crate::parser::objects::PdfDict;
+use crate::parser::version::PdfVersion;
 
 use super::rc4::Rc4;
 
@@ -79,9 +80,21 @@ pub struct EncryptionHandler {
 impl EncryptionHandler {
     /// Build from the `/Encrypt` dictionary found in the trailer.
     ///
+    /// `version` is the file-header version (Phase A) used for the encryption
+    /// policy gate: RC4 revisions are *removed* from PDF 2.0 (ISO 32000-2),
+    /// so a file claiming 2.0-or-later with V1/V2/V3 is rejected gracefully
+    /// (R1 — never a panic) while v1.x files keep working, as required by our
+    /// dual-version support policy (`.doc/pdf2-support-plan-2026-11-07.md`).
+    ///
     /// Returns `Ok(None)` if the trailer has no `/Encrypt` entry.
-    /// Returns `Err(PdfError::Encrypted)` if the password is wrong.
-    pub fn from_trailer(trailer: &PdfDict, doc_id: &[u8], password: &[u8]) -> Result<Option<Self>> {
+    /// Returns `Err(PdfError::Encrypted)` if the password is wrong or the
+    /// policy gate rejects the algorithm set.
+    pub fn from_trailer(
+        trailer: &PdfDict,
+        doc_id: &[u8],
+        password: &[u8],
+        version: PdfVersion,
+    ) -> Result<Option<Self>> {
         use crate::parser::objects::PdfObject;
 
         let encrypt_obj = match trailer.get("Encrypt") {
@@ -104,6 +117,24 @@ impl EncryptionHandler {
 
         let v = dict_int(dict, "V", 0)? as u8;
         let r = dict_int(dict, "R", 0)? as u8;
+
+        // Encryption policy gate (ISO 32000-2 removed RC4; see plan Phase B).
+        // PDF 2.0 files must use AES (V=4/R=4 AES-128 or V=5/R=6 AES-256).
+        // Broken generator heuristic: 32000-2 removed R5 too, but Adobe's
+        // Acrobat-IX-extension AESV3 files used the same shape — downgrade to
+        // a warning there, keep the derived key path alive.
+        let is_rc4 = v <= 3 && r < 5;
+        if is_rc4 && version.is_pdf2_or_later() {
+            log::warn!(
+                "PDF 2.0 file uses RC4 encryption (V={}, R={}) — removed in ISO 32000-2",
+                v,
+                r
+            );
+            return Err(PdfError::Encrypted { offset: 0 });
+        }
+        if r == 5 && version.is_pdf2_or_later() {
+            log::warn!("PDF 2.0 file uses deprecated R5 encryption (superseded by R6)");
+        }
 
         if r >= 5 || v >= 5 {
             // AES-256 (Revision 5 or 6)
@@ -495,7 +526,7 @@ mod tests {
     #[test]
     fn test_no_encrypt_dict() {
         let trailer: PdfDict = PdfDict::new();
-        let result = EncryptionHandler::from_trailer(&trailer, b"", b"");
+        let result = EncryptionHandler::from_trailer(&trailer, b"", b"", PdfVersion::V1_7);
         assert!(matches!(result, Ok(None)));
     }
 
@@ -532,7 +563,7 @@ mod tests {
         trailer.insert("Encrypt".to_string(), PdfObject::Dictionary(encrypt_dict));
 
         // Empty password → Ok(Some).
-        let result = EncryptionHandler::from_trailer(&trailer, file_id, b"");
+        let result = EncryptionHandler::from_trailer(&trailer, file_id, b"", PdfVersion::V1_4);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
 
@@ -540,8 +571,65 @@ mod tests {
         let encrypt_dict2 = make_encrypt_dict(2, 3, 128, o_entry, u_entry, -4);
         let mut trailer2: PdfDict = PdfDict::new();
         trailer2.insert("Encrypt".to_string(), PdfObject::Dictionary(encrypt_dict2));
-        let result2 = EncryptionHandler::from_trailer(&trailer2, file_id, b"wrong_password");
+        let result2 = EncryptionHandler::from_trailer(
+            &trailer2,
+            file_id,
+            b"wrong_password",
+            PdfVersion::V1_4,
+        );
         assert!(matches!(result2, Err(PdfError::Encrypted { .. })));
+    }
+
+    // --- encryption policy gate (Phase B, PDF 2.0 plan) -----------------------
+
+    #[test]
+    fn test_policy_rc4_rejected_in_pdf2_file() {
+        // A PDF 2.0 file must not encrypt with RC4 (V1/V2/V3 are removed in
+        // ISO 32000-2). Reject gracefully — Err, never a panic (R1).
+        for (v, r) in [(2, 3i64), (1, 2), (3, 3)] {
+            let dict = make_encrypt_dict(v, r, 128, vec![0u8; 32], vec![0u8; 32], -4);
+            let mut trailer: PdfDict = PdfDict::new();
+            trailer.insert("Encrypt".to_string(), PdfObject::Dictionary(dict));
+            let result = EncryptionHandler::from_trailer(&trailer, b"", b"", PdfVersion::V2_0);
+            assert!(
+                matches!(result, Err(PdfError::Encrypted { .. })),
+                "RC4 V={v} R={r} must be rejected in a PDF 2.0 file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_policy_rc4_still_accepted_in_v17_file() {
+        // Dual-version rule: v1.x files with RC4 keep working (deprecation is
+        // forward-looking; legacy PDFs are everywhere).
+        let dict = make_encrypt_dict(2, 3, 128, vec![0u8; 32], vec![0u8; 32], -4);
+        let mut trailer: PdfDict = PdfDict::new();
+        trailer.insert("Encrypt".to_string(), PdfObject::Dictionary(dict));
+        // Wrong password is still Err(Encrypted) — proves the gate didn't
+        // short-circuit to Ok/panic; the R3 derivation path ran.
+        let result = EncryptionHandler::from_trailer(&trailer, b"", b"", PdfVersion::V1_4);
+        assert!(matches!(result, Err(PdfError::Encrypted { .. })));
+    }
+
+    #[test]
+    fn test_policy_aes256_r6_not_rejected_in_pdf2_file() {
+        // V=5/R=6 in a PDF 2.0 file is the normative path: wrong password must
+        // pass *through* the R6 derivation (not the policy gate).
+        let mut dict = PdfDict::new();
+        dict.insert(
+            "Filter".to_string(),
+            PdfObject::Name("Standard".to_string()),
+        );
+        dict.insert("V".to_string(), PdfObject::Integer(5));
+        dict.insert("R".to_string(), PdfObject::Integer(6));
+        dict.insert("U".to_string(), PdfObject::String(vec![0u8; 48]));
+        dict.insert("UE".to_string(), PdfObject::String(vec![0u8; 32]));
+        dict.insert("P".to_string(), PdfObject::Integer(-4));
+        let mut trailer: PdfDict = PdfDict::new();
+        trailer.insert("Encrypt".to_string(), PdfObject::Dictionary(dict));
+        // Synthetic U (all zeros) can't verify empty password → Encrypted via R6 path.
+        let result = EncryptionHandler::from_trailer(&trailer, b"", b"", PdfVersion::V2_0);
+        assert!(matches!(result, Err(PdfError::Encrypted { .. })));
     }
 
     #[test]

@@ -28,15 +28,22 @@ pub fn verify_user_password_r5(password: &[u8], u_entry: &[u8]) -> bool {
 /// Verify the user password for Revision 6.
 ///
 /// Uses Algorithm 2.B (iterative hash) for validation.
+///
+/// Per ISO 32000-2 §7.6.4.3.2 the password is a text string: both the
+/// SASLprep-normalised form and the raw bytes are tried (see
+/// [`super::password::password_candidates_for_r6`]).
 pub fn verify_user_password_r6(password: &[u8], u_entry: &[u8]) -> bool {
-    if u_entry.len() < 48 {
+    let candidates = super::password::password_candidates_for_r6(password);
+    if candidates.is_empty() || u_entry.len() < 48 {
         return false;
     }
-    let truncated = truncate_password(password);
     let validation_salt = &u_entry[32..40];
 
-    let hash = compute_hash_r6(&truncated, validation_salt, &[]);
-    hash == u_entry[..32]
+    candidates.iter().any(|candidate| {
+        let truncated = truncate_password(candidate);
+        let hash = compute_hash_r6(&truncated, validation_salt, &[]);
+        hash == u_entry[..32]
+    })
 }
 
 /// Derive the 32-byte file encryption key for Revision 5.
@@ -68,23 +75,28 @@ pub fn derive_file_key_r5(password: &[u8], u_entry: &[u8], ue_entry: &[u8]) -> R
 
 /// Derive the 32-byte file encryption key for Revision 6.
 ///
-/// Uses Algorithm 2.B for both validation and key derivation.
+/// Uses Algorithm 2.B for both validation and key derivation. Both the
+/// SASLprep-normalised password (PDF 2.0 §7.6.4.3.2 text-string path) and the
+/// raw bytes are tried, so legacy extension-era R6 files still open.
 pub fn derive_file_key_r6(password: &[u8], u_entry: &[u8], ue_entry: &[u8]) -> Result<Vec<u8>> {
-    if !verify_user_password_r6(password, u_entry) {
-        return Err(PdfError::Encrypted { offset: 0 });
-    }
     if u_entry.len() < 48 || ue_entry.len() < 32 {
         return Err(PdfError::filter_error(0, "AES-256 R6: /U or /UE too short"));
     }
-
-    let truncated = truncate_password(password);
+    let validation_salt = &u_entry[32..40];
     let key_salt = &u_entry[40..48];
-
-    let intermediate_key = compute_hash_r6(&truncated, key_salt, &[]);
-
-    // Decrypt UE with AES-256-CBC, IV = 0
     let iv = [0u8; 16];
-    aes256_cbc_decrypt_raw(&intermediate_key, &iv, ue_entry)
+
+    for candidate in super::password::password_candidates_for_r6(password) {
+        let truncated = truncate_password(&candidate);
+        if compute_hash_r6(&truncated, validation_salt, &[]) != u_entry[..32] {
+            continue;
+        }
+        let intermediate_key = compute_hash_r6(&truncated, key_salt, &[]);
+        // Decrypt UE with AES-256-CBC, IV = 0
+        return aes256_cbc_decrypt_raw(&intermediate_key, &iv, ue_entry);
+    }
+    // No candidate verified — wrong password (R7: offset carried).
+    Err(PdfError::Encrypted { offset: 0 })
 }
 
 /// AES-256-CBC decrypt with explicit IV (first 16 bytes of data if not provided separately).
@@ -311,7 +323,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(password);
-        hasher.update(&validation_salt);
+        hasher.update(validation_salt);
         let hash: [u8; 32] = hasher.finalize().into();
 
         let mut u_entry = Vec::with_capacity(48);
@@ -351,7 +363,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(password);
-        hasher.update(&validation_salt);
+        hasher.update(validation_salt);
         let hash: [u8; 32] = hasher.finalize().into();
 
         let mut u_entry = Vec::with_capacity(48);
