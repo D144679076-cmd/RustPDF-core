@@ -354,6 +354,7 @@ mod tests {
             char_advances: vec![],
             char_advances_y: vec![],
             char_cids: vec![],
+            is_type3: false,
             render_matrix_2x2: [1.0, 0.0, 0.0, -1.0],
             stroke_text: false,
         };
@@ -421,6 +422,7 @@ mod tests {
             char_advances: vec![],
             char_advances_y: vec![],
             char_cids: vec![],
+            is_type3: false,
             render_matrix_2x2: [1.0, 0.0, 0.0, -1.0],
             stroke_text: false,
         };
@@ -443,6 +445,7 @@ mod tests {
             char_advances: vec![],
             char_advances_y: vec![],
             char_cids: vec![],
+            is_type3: false,
             render_matrix_2x2: [1.0, 0.0, 0.0, -1.0],
             stroke_text: false,
         };

@@ -411,6 +411,12 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
         if span.text.is_empty() {
             return;
         }
+        // Type 3 glyph pixels were painted by executing the font's charproc
+        // streams during interpretation — rasterizing the span again would
+        // double-draw (see content::interpreter::show_text_type3).
+        if span.is_type3 {
+            return;
+        }
         // Soft mask on text is not yet composited through a temp canvas (Phase 3).
         // Text appears unmasked, which is incorrect but better than invisible.
         if self.current_soft_mask.is_some() {

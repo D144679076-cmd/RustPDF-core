@@ -229,6 +229,11 @@ pub struct TextSpan {
     /// composite (Type0/CIDFont) fonts.  For Identity-H encoding, CID == GID
     /// in the embedded font file, so the renderer can call `rasterize_indexed`.
     pub char_cids: Vec<u32>,
+    /// True when the span comes from a Type 3 font: the glyph pixels were
+    /// already painted by executing the font's charproc streams, so the page
+    /// renderer must NOT rasterize the span again (double-draw). Text
+    /// extraction still consumes span text/advances normally.
+    pub is_type3: bool,
     /// The 2×2 rotation+scale part `[a, b, c, d]` of the final render matrix
     /// (rise_matrix × text_matrix × CTM).  Used by the renderer to rotate glyph
     /// bitmaps.  For upright text this is approximately `[scale, 0, 0, -scale]`.

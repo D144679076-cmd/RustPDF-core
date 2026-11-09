@@ -16,4 +16,5 @@ pub mod font_cache;
 pub mod standard;
 pub mod truetype;
 pub mod type1;
+pub mod type3;
 pub mod types;

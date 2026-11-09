@@ -125,6 +125,8 @@ pub struct ContentInterpreter {
     error_count: u32,
     /// Object refs seen during Form XObject recursion (cycle detection).
     xobject_stack: HashSet<u32>,
+    /// Depth of nested Type 3 charproc executions (recursion guard).
+    type3_depth: usize,
 }
 
 const MAX_ERRORS: u32 = 2000;
@@ -139,6 +141,7 @@ impl ContentInterpreter {
             current_point: None,
             error_count: 0,
             xobject_stack: HashSet::new(),
+            type3_depth: 0,
         }
     }
 
@@ -542,7 +545,27 @@ impl ContentInterpreter {
             Operator::BeginCompat | Operator::EndCompat => {}
 
             // --- Type 3 font operators ---
-            Operator::Type3Width | Operator::Type3WidthBBox => {}
+            // d0 (width y-coord) is advisory — our advance comes from /Widths.
+            // d1 carries the glyph /BBox as a clip rect in glyph space; the
+            // current CTM is already the glyph matrix, so push it like a form
+            // BBox clip (§8.10.2 semantics).
+            Operator::Type3Width => {}
+            Operator::Type3WidthBBox => match (int(operands, 0), int(operands, 1)) {
+                (Ok(_), Ok(_)) => {
+                    let llx = int(operands, 2)? as f64;
+                    let lly = int(operands, 3)? as f64;
+                    let urx = int(operands, 4)? as f64;
+                    let ury = int(operands, 5)? as f64;
+                    let mut clip = Path::new();
+                    clip.rect(llx, lly, urx - llx, ury - lly);
+                    self.gfx.current.clip_path.push(ClipEntry {
+                        path: clip,
+                        rule: crate::content::graphics_state::FillRule::NonZero,
+                        ctm: self.gfx.current.ctm,
+                    });
+                }
+                _ => return Err(PdfError::invalid_token(0, "d1 needs 6 numeric operands")),
+            },
 
             // --- Shading ---
             Operator::Shading => {
@@ -588,6 +611,31 @@ impl ContentInterpreter {
         let (cmap, is_composite, font_widths) =
             resolve_font_info(&self.text.font_name, doc, resources);
 
+        // Type 3 fonts carry their glyphs as charproc content streams, not
+        // embedded font programs — they take an entirely different drawing
+        // path (§9.6.5). The charproc run paints the glyph pixels directly;
+        // the span below is still emitted (flagged `is_type3`) so text
+        // extraction keeps working. Return value carries the per-glyph pixel
+        // advances this path just consumed.
+        let mut type3_advances: Option<(Vec<f64>, Vec<f64>)> = None;
+        if let Some(font_dict) = resolve_font_dict(&self.text.font_name, doc, resources) {
+            let is_type3 = font_dict
+                .get("Subtype")
+                .and_then(|o| o.as_name())
+                .map(|s| s == "Type3")
+                .unwrap_or(false);
+            if is_type3 {
+                match self.show_text_type3(bytes, device, doc, resources, &font_dict, &font_widths)
+                {
+                    Ok(adv) => type3_advances = adv,
+                    Err(e) => {
+                        self.error_count = self.error_count.saturating_add(1);
+                        log::warn!("[type3] charproc show failed: {}", e);
+                    }
+                }
+            }
+        }
+
         let text: String = if let Some(ref cm) = cmap {
             decode_bytes_with_cmap(bytes, cm, is_composite)
         } else if is_composite {
@@ -612,6 +660,7 @@ impl ContentInterpreter {
         // and text extraction get accurate bounding boxes.
         let total_width =
             compute_text_width(bytes, is_composite, &font_widths, self.text.font_size);
+        let painted_as_type3 = type3_advances.is_some();
 
         // Advance text position using actual glyph widths, capturing pixel-space
         // advances so the renderer can use them instead of fontdue's glyph metrics.
@@ -619,7 +668,12 @@ impl ContentInterpreter {
         let mut char_advances: Vec<f64> = Vec::new();
         let mut char_advances_y: Vec<f64> = Vec::new();
         let mut char_cids: Vec<u32> = Vec::new();
-        if is_composite {
+        if let Some((ax, ay)) = type3_advances {
+            // The Type 3 charproc path already advanced the text matrix while
+            // painting — reuse its pixel advances and skip the width loop.
+            char_advances = ax;
+            char_advances_y = ay;
+        } else if is_composite {
             let mut pending_advance: f64 = 0.0;
             let mut pending_advance_y: f64 = 0.0;
             for chunk in bytes.chunks(2) {
@@ -738,6 +792,7 @@ impl ContentInterpreter {
                 char_advances,
                 char_advances_y,
                 char_cids,
+                is_type3: painted_as_type3,
                 render_matrix_2x2: [
                     render_matrix.a,
                     render_matrix.b,
@@ -1038,6 +1093,129 @@ impl ContentInterpreter {
 
         Ok(())
     }
+
+    /// Render a Type 3 font string by executing each glyph's charproc content
+    /// stream (ISO 32000-1 §9.6.5).
+    ///
+    /// For every character code the corresponding charproc is run through the
+    /// interpreter inside:
+    ///  - a glyph CTM of `trm` ∘ `/FontMatrix` (glyph space → device),
+    ///  - a clip to `/FontBBox` (charprocs that carry `d1` add their own
+    ///    glyph-level bbox clip via `Operator::Type3WidthBBox`).
+    ///
+    /// Fill/stroke color state is inherited from the `Tj` context, as the
+    /// spec requires. Advances come from `/Widths` (via `font_widths`), and
+    /// the returned pair carries the pixel-space advance per code so
+    /// [`Self::show_text`] can emit an extraction span without advancing a
+    /// second time.
+    ///
+    /// Returns `Ok(None)` when nothing was painted (no doc, unresolvable
+    /// font, recursion limit) — the caller then falls back to the normal
+    /// advance loop.
+    #[allow(clippy::too_many_arguments)]
+    fn show_text_type3(
+        &mut self,
+        bytes: &[u8],
+        device: &mut dyn OutputDevice,
+        doc: Option<&PdfDocument>,
+        resources: Option<&crate::parser::objects::PdfDict>,
+        font_dict: &crate::parser::objects::PdfDict,
+        font_widths: &Option<crate::fonts::types::FontWidths>,
+    ) -> Result<Option<(Vec<f64>, Vec<f64>)>> {
+        /// Charprocs that invoke Type 3 text ops recurse; 3 levels is far
+        /// beyond any real document (0 is typical).
+        const MAX_TYPE3_DEPTH: usize = 3;
+
+        let doc = match doc {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        if self.type3_depth >= MAX_TYPE3_DEPTH {
+            log::warn!(
+                "[type3] charproc recursion limit (depth >= {})",
+                MAX_TYPE3_DEPTH
+            );
+            return Ok(None);
+        }
+
+        let t3 = match crate::fonts::type3::Type3Font::from_dict(doc, font_dict) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[type3] font dict parse failed: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut xs = Vec::with_capacity(bytes.len());
+        let mut ys = Vec::with_capacity(bytes.len());
+
+        for &code in bytes {
+            let trm = self.text.get_render_matrix(&self.gfx.current.ctm);
+
+            if let Some(glyph_name) = t3.glyph_name(code) {
+                match t3.charproc(doc, glyph_name) {
+                    Some((content, cp_resources)) => {
+                        let glyph_ctm = trm.concat(&t3.font_matrix);
+                        self.gfx.save();
+                        self.gfx.current.ctm = glyph_ctm;
+                        // Fallback clip: the font-level /FontBBox in glyph
+                        // space. Charprocs with `d1` push a tighter clip on
+                        // top of this one.
+                        let [llx, lly, urx, ury] = t3.font_bbox;
+                        if urx > llx && ury > lly {
+                            let mut rect = Path::new();
+                            rect.rect(llx, lly, urx - llx, ury - lly);
+                            self.gfx.current.clip_path.push(ClipEntry {
+                                path: rect,
+                                rule: FillRule::NonZero,
+                                ctm: self.gfx.current.ctm,
+                            });
+                        }
+                        // Charproc /Resources override the font's; both fall
+                        // back to the page resources of the Tj context.
+                        let proc_resources = cp_resources
+                            .or_else(|| t3.resources.clone())
+                            .or_else(|| resources.cloned());
+                        self.type3_depth += 1;
+                        let result = self.interpret_iter(
+                            ContentStreamIter::new(&content),
+                            device,
+                            Some(doc),
+                            Some(&proc_resources.unwrap_or_default()),
+                        );
+                        self.type3_depth -= 1;
+                        if let Err(e) = result {
+                            log::warn!("[type3] charproc `{}` exec failed: {}", glyph_name, e);
+                        }
+                        if let Err(e) = self.gfx.restore() {
+                            log::warn!("[type3] state restore failed: {}", e);
+                        }
+                    }
+                    None => {
+                        log::debug!(
+                            "[type3] no charproc for glyph `{}` (code {})",
+                            glyph_name,
+                            code
+                        );
+                    }
+                }
+            }
+
+            // Advance from /Widths — identical to the simple-font path.
+            let w = font_widths
+                .as_ref()
+                .map(|fw| fw.get_width(code as u32))
+                .unwrap_or(500.0);
+            let pre = self.text.get_render_matrix(&self.gfx.current.ctm);
+            self.text
+                .advance_glyph(w / 1000.0 * self.text.font_size, code == b' ');
+            let post = self.text.get_render_matrix(&self.gfx.current.ctm);
+            xs.push((post.e - pre.e).abs());
+            ys.push(post.f - pre.f);
+        }
+
+        Ok(Some((xs, ys)))
+    }
 }
 
 impl Default for ContentInterpreter {
@@ -1179,6 +1357,28 @@ fn compute_text_width(
 
 /// Resolve ToUnicode CMap, composite-font flag, and width table for a font
 /// resource name.  Returns `(cmap, is_composite, widths)`.
+/// Resolve the font dictionary for `font_name` out of the page /Font
+/// resources — shared by `resolve_font_info` and the Type 3 path.
+pub(crate) fn resolve_font_dict(
+    font_name: &str,
+    doc: Option<&PdfDocument>,
+    resources: Option<&crate::parser::objects::PdfDict>,
+) -> Option<crate::parser::objects::PdfDict> {
+    let (doc, res) = match (doc, resources) {
+        (Some(d), Some(r)) => (d, r),
+        _ => return None,
+    };
+    let font_dict = match res.get("Font") {
+        Some(PdfObject::Dictionary(d)) => d,
+        _ => return None,
+    };
+    let font_ref = font_dict.get(font_name)?;
+    match doc.resolve(font_ref) {
+        Ok(PdfObject::Dictionary(d)) => Some(d.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn resolve_font_info(
     font_name: &str,
     doc: Option<&PdfDocument>,

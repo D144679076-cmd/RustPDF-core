@@ -265,6 +265,29 @@ impl Clone for PdfDocument {
 }
 
 impl PdfDocument {
+    /// An empty document shell — no objects, no trailer, footage version 1.7.
+    ///
+    /// Useful for unit tests and constructing standalone object graphs
+    /// (fonts, functions, encodings) whose value objects need resolution
+    /// context. `resolve` on non-reference objects still works; reference
+    /// resolution fails cleanly.
+    pub fn empty() -> Self {
+        PdfDocument {
+            data: Vec::new(),
+            version: crate::parser::version::PdfVersion::from_parts(1, 7),
+            xref: HashMap::new(),
+            trailer: PdfDict::new(),
+            obj_stream_cache: RwLock::new(HashMap::new()),
+            decoded_stream_cache: RwLock::new(HashMap::new()),
+            overrides: RwLock::new(HashMap::new()),
+            page_refs: RwLock::new(None),
+            #[cfg(feature = "crypto")]
+            enc: None,
+            #[cfg(feature = "crypto")]
+            permissions: None,
+        }
+    }
+
     /// Parse a PDF from its raw bytes.
     ///
     /// Locates `startxref`, loads all XRef sections following `/Prev` chains,
