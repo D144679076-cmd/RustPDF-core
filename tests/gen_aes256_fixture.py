@@ -144,7 +144,7 @@ def make_xref_entry(offset: int, gen: int, entry_type: str) -> bytes:
 # Build the encrypted PDF
 # ---------------------------------------------------------------------------
 
-def write_encrypted_aes256_pdf(path: str, password: bytes = PASSWORD) -> None:
+def write_encrypted_aes256_pdf(path: str, password: bytes = PASSWORD, header: bytes = b"%PDF-1.7\n") -> None:
     file_key = secrets.token_bytes(32)
     u_entry, ue_entry = make_u_ue(password, file_key)
     o_entry, oe_entry = make_o_oe(password, file_key, u_entry)
@@ -169,7 +169,7 @@ def write_encrypted_aes256_pdf(path: str, password: bytes = PASSWORD) -> None:
     # The Rust `from_trailer` handler reads /Encrypt directly from the trailer
     # dict (no indirect-reference resolution at that stage), so we inline the
     # encrypt dictionary in the trailer rather than using an indirect object.
-    header = b"%PDF-1.7\n"
+    header = header
 
     obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
     obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
@@ -199,9 +199,22 @@ def write_encrypted_aes256_pdf(path: str, password: bytes = PASSWORD) -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
     os.makedirs(FIXTURES_DIR, exist_ok=True)
     print("Generating AES-256 encrypted PDF fixture...")
     write_encrypted_aes256_pdf(
         os.path.join(FIXTURES_DIR, "encrypted_aes256.pdf"), PASSWORD
     )
     print("Done. User password: 'test'")
+
+    if "--pdf2" in sys.argv:
+        # ISO-normative pairing: R6 (AES-256) inside a %PDF-2.0 file, opened
+        # with a non-ASCII UTF-8 password (Phase B Unicode-password path).
+        password = "pässwörd".encode("utf-8")
+        write_encrypted_aes256_pdf(
+            os.path.join(FIXTURES_DIR, "pdf2-r6-utf8-password.pdf"),
+            password,
+            header=b"%PDF-2.0\n",
+        )
+        print("Done. User password: 'pässwörd' (UTF-8)")
