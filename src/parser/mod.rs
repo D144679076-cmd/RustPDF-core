@@ -6,6 +6,9 @@
 //! - [`objects`] — full object model, document loader, reference resolution
 //! - [`version`] — `%PDF-m.n` header detection, [`PdfVersion`] model
 
+pub mod ccitt;
+pub mod ccitt_parms;
+pub mod ccitt_tables;
 pub mod filters;
 pub mod lexer;
 pub mod objects;

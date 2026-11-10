@@ -24,3 +24,6 @@ test_output/
 
 # MuPDF reference renders (84 MB; regenerate with tests/gen_snapshot_refs.sh)
 tests/fixtures/ref/
+
+# node harness produced by tests/gen_ccitt_fixtures.py
+tests/.ccittref/

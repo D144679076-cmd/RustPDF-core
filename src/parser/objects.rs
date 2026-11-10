@@ -94,8 +94,18 @@ impl PdfStream {
     /// available — it also resolves indirect references.
     pub fn decode(&self) -> Result<Vec<u8>> {
         let filter_names = self.filter_names();
-        let names: Vec<&str> = filter_names.iter().map(|s| s.as_str()).collect();
+        let mut names: Vec<&str> = filter_names.iter().map(|s| s.as_str()).collect();
+        // CCITTFaxDecode must be the last filter (ISO 32000-1 §7.4.6) and
+        // needs its /DecodeParms — handled outside the plain pipeline.
+        let is_ccitt = matches!(names.last(), Some(&"CCITTFaxDecode") | Some(&"CCF"));
+        if is_ccitt {
+            names.pop();
+        }
         let data = filters::apply_pipeline(&names, &self.raw_data)?;
+        if is_ccitt {
+            let parms = self.decode_parms().cloned();
+            return super::ccitt::decode(&data, parms.as_ref());
+        }
         if let Some(parms) = self.decode_parms() {
             apply_predictor(data, parms)
         } else {
@@ -109,7 +119,11 @@ impl PdfStream {
     /// Prefer this over `decode()` whenever a `PdfDocument` is available.
     pub fn decode_with_doc(&self, doc: &PdfDocument) -> Result<Vec<u8>> {
         let filter_names = self.filter_names();
-        let names: Vec<&str> = filter_names.iter().map(|s| s.as_str()).collect();
+        let mut names: Vec<&str> = filter_names.iter().map(|s| s.as_str()).collect();
+        let is_ccitt = matches!(names.last(), Some(&"CCITTFaxDecode") | Some(&"CCF"));
+        if is_ccitt {
+            names.pop();
+        }
         let data = filters::apply_pipeline(&names, &self.raw_data)?;
 
         // /DecodeParms may be a direct dict, an array, or an indirect reference.
@@ -143,6 +157,10 @@ impl PdfStream {
                     );
                 }
             }
+        }
+
+        if is_ccitt {
+            return super::ccitt::decode(&data, parms.as_ref());
         }
 
         if let Some(ref p) = parms {
