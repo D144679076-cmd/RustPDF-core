@@ -16,7 +16,6 @@ use crate::error::Result;
 use crate::parser::objects::PdfDocument;
 
 use super::layout::{TextLine, TextWord};
-
 /// Collects text spans from a page and groups them into lines and words.
 pub struct TextExtractor {
     spans: Vec<TextSpan>,
@@ -140,6 +139,45 @@ impl TextExtractor {
         .collect::<Vec<_>>()
         .join("\n")
     }
+
+    /// Split the page's words into vertical columns and return them
+    /// (see [`columns::split_columns`] for the gutter algorithm).
+    pub fn into_columns(self, min_gap: f64) -> Vec<Vec<TextWord>> {
+        super::columns::split_columns(self.words(), min_gap)
+    }
+
+    /// Plain text in column-aware reading order: columns left-to-right,
+    /// lines top-to-bottom within each column.
+    pub fn plain_text_columns(&self, min_gap: f64) -> String {
+        TextExtractor {
+            spans: self.spans.clone(),
+        }
+        .into_columns(min_gap)
+        .iter()
+        .map(|col| super::columns::column_text(col))
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Plain text with end-of-line hyphenation repaired (see
+    /// [`dehyphenate::dehyphenate`]).
+    pub fn plain_text_dehyphenated(&self) -> String {
+        let lines: Vec<String> = TextExtractor {
+            spans: self.spans.clone(),
+        }
+        .into_lines()
+        .iter()
+        .map(|l| l.text())
+        .collect();
+        super::dehyphenate::dehyphenate(&lines).join("\n")
+    }
+
+    /// Lines built from rotated text runs (90°/180°/270°), grouped per
+    /// orientation. Horizontal (0°) text is *not* included — use
+    /// [`TextExtractor::into_lines`] for the normal flow.
+    pub fn rotated_lines(&self) -> Vec<(u16, Vec<TextLine>)> {
+        super::rotated::group_rotated(&self.spans)
+    }
 }
 
 impl Default for TextExtractor {
@@ -152,6 +190,10 @@ impl Default for TextExtractor {
 ///
 /// Consecutive spans are merged into the same word when the gap between them
 /// is less than `prev.font_size * 0.3`; otherwise a new word begins.
+///
+/// Bidirectional fix-up (see [`bidi::reorder_visual_to_logical`]): PDFs emit
+/// glyphs in visual order, so RTL character runs inside each word are
+/// reversed into logical order, and runs of RTL words are re-sequenced.
 fn build_line(spans: Vec<TextSpan>) -> TextLine {
     debug_assert!(!spans.is_empty());
 
@@ -181,6 +223,15 @@ fn build_line(spans: Vec<TextSpan>) -> TextLine {
             });
         }
     }
+
+    // Visual→logical bidi recovery: per-word character runs first, then
+    // word order for RTL phrases (which are laid out right-to-left).
+    for word in &mut words {
+        word.text = super::bidi::reorder_visual_to_logical(&word.text);
+    }
+    let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+    let order = super::bidi::reorder_rtl_words(&texts);
+    let words: Vec<TextWord> = order.into_iter().map(|i| words[i].clone()).collect();
 
     let last = spans.last().unwrap();
     let line_width = (last.x + last.width) - line_x;
@@ -291,5 +342,88 @@ mod tests {
         assert_eq!(lines[0].words[0].text, "Top");
         assert_eq!(lines[1].words[0].text, "Middle");
         assert_eq!(lines[2].words[0].text, "Bottom");
+    }
+
+    #[test]
+    fn rtl_visual_text_comes_out_logical() {
+        // Hebrew "שלום" emitted visually (leftmost glyph first) in one span.
+        let mut extractor = TextExtractor::new();
+        extractor.spans.push(span("םולש", 10.0, 700.0, 40.0, 12.0));
+        let text = extractor.plain_text();
+        assert_eq!(text, "שלום");
+    }
+
+    #[test]
+    fn rtl_word_order_is_reversed_across_words() {
+        // Visual X order: "world" left, Hebrew word middle-right, "hello" right.
+        let mut extractor = TextExtractor::new();
+        extractor.spans.push(span("world", 10.0, 700.0, 40.0, 12.0));
+        extractor.spans.push(span("םולש", 200.0, 700.0, 40.0, 12.0));
+        extractor
+            .spans
+            .push(span("hello", 400.0, 700.0, 40.0, 12.0));
+        let text = extractor.plain_text();
+        // RTL word runs reverse: the two RTL-adjacent... "hello" has no RTL,
+        // so only the Hebrew run (one word) stays; LTR words keep order.
+        assert_eq!(text, "world שלום hello");
+    }
+
+    #[test]
+    fn columns_split_reading_order() {
+        let mut extractor = TextExtractor::new();
+        // Left column lines (x ≈ 50) and right column lines (x ≈ 350),
+        // interleaved in collection order.
+        extractor.spans.push(span("L1", 50.0, 700.0, 200.0, 12.0));
+        extractor.spans.push(span("R1", 350.0, 700.0, 200.0, 12.0));
+        extractor.spans.push(span("L2", 50.0, 650.0, 190.0, 12.0));
+        extractor.spans.push(span("R2", 350.0, 650.0, 190.0, 12.0));
+        let text = extractor.plain_text_columns(40.0);
+        assert_eq!(text, "L1\nL2\nR1\nR2");
+    }
+
+    #[test]
+    fn plain_text_columns_no_gutter_is_normal_order() {
+        let mut extractor = TextExtractor::new();
+        extractor.spans.push(span("one", 50.0, 700.0, 200.0, 12.0));
+        extractor.spans.push(span("two", 55.0, 650.0, 190.0, 12.0));
+        let text = extractor.plain_text_columns(40.0);
+        assert_eq!(text, "one\ntwo");
+    }
+
+    #[test]
+    fn dehyphenated_plain_text_joins_broken_word() {
+        let mut extractor = TextExtractor::new();
+        extractor
+            .spans
+            .push(span("over the la-", 10.0, 700.0, 80.0, 12.0));
+        extractor
+            .spans
+            .push(span("zy dog.", 10.0, 650.0, 60.0, 12.0));
+        let text = extractor.plain_text_dehyphenated();
+        assert_eq!(text, "over the lazy dog.");
+    }
+
+    #[test]
+    fn rotated_spans_group_separately() {
+        let vertical = |text: &str, x: f64, y: f64| {
+            let mut s = span(text, x, y, 24.0, 12.0);
+            // 90° advance direction (0, 1) in user space.
+            s.render_matrix_2x2 = [0.0, 1.0, 1.0, 0.0];
+            s
+        };
+        // Horizontal line — goes through the normal flow only.
+        let mut horizontal = TextExtractor::new();
+        horizontal.spans.push(span("flat", 10.0, 700.0, 30.0, 12.0));
+        // 90° run: two spans stacked along -x (consecutive vertical lines).
+        let mut rotated_ex = TextExtractor::new();
+        rotated_ex.spans.push(vertical("UP1", 100.0, 10.0));
+        rotated_ex.spans.push(vertical("UP2", 100.0, 40.0));
+        let rotated = rotated_ex.rotated_lines();
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(rotated[0].0, 90);
+        assert_eq!(rotated[0].1.len(), 1);
+        assert_eq!(rotated[0].1[0].words[0].text, "UP1UP2");
+        // Horizontal text unaffected.
+        assert_eq!(horizontal.plain_text(), "flat");
     }
 }
