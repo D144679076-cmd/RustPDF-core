@@ -253,7 +253,7 @@ impl<'doc> PageRenderer<'doc> {
     /// Pixels outside the mask bounds are made fully transparent.
     fn apply_mask_to_image(
         mask: &SoftMask,
-        rgba: &mut Vec<u8>,
+        rgba: &mut [u8],
         dst_x: i32,
         dst_y: i32,
         dst_w: u32,

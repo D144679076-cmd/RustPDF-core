@@ -106,6 +106,20 @@ pub fn eval2(src: &[u8], t0: f64, t1: f64, domain: [f64; 4]) -> Result<Vec<f64>,
     Ok(stack.into_iter().filter_map(|v| v.as_num()).collect())
 }
 
+/// Evaluate a FunctionType 4 function with **one** input `t` — the mesh
+/// /Function override form (ShadingTypes 4–7): each colour record carries a
+/// single t value which the function maps to colour components (§8.7.4.4).
+/// `domain` is the function's /Domain `[x_lo, x_hi]`.
+pub fn eval1(src: &[u8], t: f64, domain: [f64; 2]) -> Result<Vec<f64>, String> {
+    let a = norm01(t, domain[0], domain[1]);
+
+    let tokens = tokenize(src)?;
+    let mut stack = vec![Value::Num(a)];
+    let mut i = 0usize;
+    eval_tokens(&tokens, &mut i, &mut stack)?;
+    Ok(stack.into_iter().filter_map(|v| v.as_num()).collect())
+}
+
 fn norm01(t: f64, lo: f64, hi: f64) -> f64 {
     if hi > lo {
         clamp01((t - lo) / (hi - lo))

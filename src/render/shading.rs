@@ -1,10 +1,11 @@
 //! PDF Shading (gradient) rasteriser — ISO 32000-1 §8.7.
 //!
 //! ShadingTypes implemented here: 2 (axial) and 3 (radial) inline; mesh types
-//! (4 free-form / 5 lattice) via `mesh`, function-based type 1 via
-//! `function_shaded`, with the FunctionType 4 PostScript evaluator in `ps`.
-//! Function types 2 (Exponential) and 3 (Stitching) supported for the
-//! 1-input axial/radial path; Type 0 (sampled) is not yet implemented.
+//! 4 (free-form) / 5 (lattice) via `mesh` and 6 (Coons) / 7 (tensor) via
+//! `patch`, function-based type 1 via `function_shaded`, with the
+//! FunctionType 4 PostScript evaluator in `ps`. Function types 2
+//! (Exponential) and 3 (Stitching) supported for the 1-input axial/radial
+//! path; Type 0 (sampled) is not yet implemented.
 
 use crate::content::graphics_state::Matrix;
 use crate::error::{PdfError, Result};
@@ -14,6 +15,7 @@ use super::canvas::PixmapBuffer;
 
 mod function_shaded;
 mod mesh;
+mod patch;
 mod ps;
 
 pub use function_shaded::FunctionShading;
@@ -192,12 +194,29 @@ impl ShadingFunction {
             }
             ShadingFunction::PostScript { .. } => {
                 // 1-input eval is meaningless for the 2-input PostScript
-                // calculator; renderers route through `eval2`. Return a flat
-                // grey so axial/radial callers that somehow attach one don't
-                // crash.
+                // calculator; renderers route through `eval2` (see `eval1`
+                // for the mesh 1-input path). Return a flat grey so
+                // axial/radial callers that somehow attach one don't crash.
                 log::warn!("1-input eval on PostScript function; using grey");
                 vec![0.5]
             }
+        }
+    }
+
+    /// Evaluate a **1-input** function at `t` — the mesh /Function override
+    /// form (§8.7.4.4: each colour record carries one t value).
+    ///
+    /// PostScript (FunctionType 4) functions run through the calculator with
+    /// a single-value stack; the other types evaluate like [`Self::eval`].
+    ///
+    /// # Errors
+    /// Malformed PostScript programs.
+    pub fn eval1(&self, t: f64) -> std::result::Result<Vec<f64>, String> {
+        match self {
+            ShadingFunction::PostScript { body, ps_domain } => {
+                ps::eval1(body, t, [ps_domain[0], ps_domain[1]])
+            }
+            other => Ok(other.eval(t)),
         }
     }
 
@@ -257,7 +276,9 @@ pub enum Shading {
     Radial(RadialShading),
     /// ShadingType 1 — per-pixel 2-input function (see `function_shaded.rs`).
     FunctionBased(FunctionShading),
-    /// ShadingType 4/5 — Gouraud meshes (see `mesh.rs`); 6/7 deferred.
+    /// ShadingType 4/5 — free-form/lattice Gouraud meshes (`mesh.rs`) and
+    /// ShadingType 6/7 — Coons/tensor patch meshes (`patch.rs`); both decode
+    /// into the same vertex/triangle lattice.
     Mesh(MeshShading),
 }
 
@@ -310,13 +331,19 @@ impl Shading {
         // Infer component count from color space name.
         let n_components = cs_n_components(dict.get("ColorSpace"));
 
-        let fn_obj = dict
-            .get("Function")
-            .ok_or_else(|| PdfError::invalid_token(0, "shading missing /Function"))?;
-        let function = ShadingFunction::parse(fn_obj, doc)?;
+        let fn_obj = dict.get("Function");
+        // /Function is required for Types 1–3; for mesh Types 4–7 it is an
+        // optional override (§8.7.4.4: when present, each colour record
+        // carries a single t value expanded through the function).
+        let function = match fn_obj {
+            Some(o) => Some(ShadingFunction::parse(o, doc)?),
+            None => None,
+        };
 
         match shading_type {
             2 => {
+                let function = function
+                    .ok_or_else(|| PdfError::invalid_token(0, "shading missing /Function"))?;
                 let coords = dict_f64_array(dict, "Coords")
                     .ok_or_else(|| PdfError::invalid_token(0, "axial shading missing /Coords"))?;
                 if coords.len() < 4 {
@@ -337,8 +364,11 @@ impl Shading {
                 }))
             }
             3 => {
+                let function = function
+                    .ok_or_else(|| PdfError::invalid_token(0, "shading missing /Function"))?;
                 let coords = dict_f64_array(dict, "Coords")
-                    .ok_or_else(|| PdfError::invalid_token(0, "radial shading missing /Coords"))?;                if coords.len() < 6 {
+                    .ok_or_else(|| PdfError::invalid_token(0, "radial shading missing /Coords"))?;
+                if coords.len() < 6 {
                     return Err(PdfError::invalid_token(
                         0,
                         "radial shading Coords needs 6 values",
@@ -357,25 +387,32 @@ impl Shading {
                     n_components,
                 }))
             }
-            1 => Ok(Shading::FunctionBased(FunctionShading::parse(
-                dict, function, n_components,
-            )?)),            4 | 5 => {
+            1 => {
+                let function = function
+                    .ok_or_else(|| PdfError::invalid_token(0, "shading missing /Function"))?;
+                Ok(Shading::FunctionBased(FunctionShading::parse(
+                    dict,
+                    function,
+                    n_components,
+                )?))
+            }
+            4..=7 => {
                 if data.is_empty() {
                     return Err(PdfError::invalid_token(
                         0,
                         "mesh shading (types 4–7) requires a stream object with data",
                     ));
                 }
-                Ok(Shading::Mesh(mesh::parse(
-                    dict,
-                    &data,
-                    shading_type as u32,
-                )?))
+                let mesh = match shading_type {
+                    6 | 7 => patch::parse(dict, &data, shading_type as u32, function.as_ref())?,
+                    _ => mesh::parse(dict, &data, shading_type as u32, function.as_ref())?,
+                };
+                Ok(Shading::Mesh(mesh))
             }
             other => Err(PdfError::invalid_token(
                 0,
                 format!(
-                    "unsupported ShadingType {} (types 1–5 supported; 0 sampled, 6 Coons / 7 tensor deferred)",
+                    "unsupported ShadingType {} (types 1–7 supported; 0 sampled not implemented)",
                     other
                 ),
             )),

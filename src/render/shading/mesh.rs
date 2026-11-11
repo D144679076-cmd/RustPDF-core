@@ -10,8 +10,9 @@
 //! The `ps` index stack reproduces pdf.js exactly — every 3 consecutive
 //! entries form one triangle.
 //!
-//! Types 6 (Coons) and 7 (tensor) are deferred — see
-//! `.doc/render-mesh-shading-2026-11-09.md`. Pure Rust, no new deps (R2);
+//! Types 6 (Coons) and 7 (tensor) live in `patch.rs` — see
+//! `.doc/render-mesh-shading-2026-11-09.md` and
+//! `.doc/shading-patch-2026-11-11.md`. Pure Rust, no new deps (R2);
 //! no panic paths (R1).
 
 use crate::content::graphics_state::Matrix;
@@ -42,18 +43,25 @@ pub struct MeshShading {
 // Bit reader (MSB-first streams, byte-aligned per vertex)
 // ---------------------------------------------------------------------------
 
-struct BitReader<'a> {
+/// MSB-first bit reader over the mesh stream. Shared with `patch.rs`
+/// (ShadingTypes 6/7).
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
-    bit_pos: usize,
+    pub(crate) bit_pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         BitReader { data, bit_pos: 0 }
     }
 
+    /// Total stream length in bits — loop bound for record readers.
+    pub(crate) fn len_bits(&self) -> usize {
+        self.data.len() * 8
+    }
+
     /// Read `bits` (≤ 32) starting at the current bit position.
-    fn read_bits(&mut self, bits: u32) -> Result<u32> {
+    pub(crate) fn read_bits(&mut self, bits: u32) -> Result<u32> {
         if bits == 0 || bits > 32 {
             return Err(PdfError::invalid_token(0, "mesh field width out of range"));
         }
@@ -71,7 +79,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Discard bits up to the next byte boundary (each vertex is byte-aligned).
-    fn align(&mut self) {
+    pub(crate) fn align(&mut self) {
         if !self.bit_pos.is_multiple_of(8) {
             self.bit_pos += 8 - (self.bit_pos % 8);
         }
@@ -86,7 +94,8 @@ impl<'a> BitReader<'a> {
 // Parsing
 // ---------------------------------------------------------------------------
 
-fn decode_int(dict: &PdfDict, key: &str, lo: u32, hi: u32) -> Result<u32> {
+/// Read one dict integer in `[lo, hi]` — shared with `patch.rs`.
+pub(crate) fn decode_int(dict: &PdfDict, key: &str, lo: u32, hi: u32) -> Result<u32> {
     let n = dict
         .get(key)
         .and_then(|o| o.as_integer())
@@ -101,7 +110,7 @@ fn decode_int(dict: &PdfDict, key: &str, lo: u32, hi: u32) -> Result<u32> {
 }
 
 /// Mesh Decode mapping: `raw/(2^bits - 1)` into `[lo, hi]` (§8.7.4.3).
-fn map_unit(raw: u32, bits: u32, lo: f64, hi: f64) -> f64 {
+pub(crate) fn map_unit(raw: u32, bits: u32, lo: f64, hi: f64) -> f64 {
     let max = (1u64 << bits.min(31)) as f64 - 1.0;
     if max <= 0.0 {
         return lo;
@@ -117,10 +126,109 @@ fn obj_f64(o: &PdfObject) -> Option<f64> {
     }
 }
 
+/// Common mesh decode parameters (shared with `patch.rs`).
+pub(crate) struct MeshDecode {
+    pub bits_coord: u32,
+    pub bits_comp: u32,
+    pub coord_de: [[f64; 2]; 2],
+    pub comp_de: Vec<[f64; 2]>,
+    /// `/Function` override: colour records carry 1 component (the t input)
+    /// which is expanded through this function into colour-space components
+    /// (§8.7.4.4). `None` → records carry `n_components` raw components.
+    pub function: Option<super::ShadingFunction>,
+    /// Colour-space component count (output width).
+    pub n_components: usize,
+}
+
+impl MeshDecode {
+    pub(crate) fn from_dict(
+        dict: &PdfDict,
+        function: Option<super::ShadingFunction>,
+    ) -> Result<Self> {
+        let bits_coord = decode_int(dict, "BitsPerCoordinate", 1, 32)?;
+        let bits_comp = decode_int(dict, "BitsPerComponent", 1, 16)?;
+
+        let mut decode: Vec<f64> = Vec::new();
+        if let Some(PdfObject::Array(arr)) = dict.get("Decode") {
+            decode.extend(arr.iter().filter_map(obj_f64));
+        }
+
+        let n_components = cs_n_components(dict.get("ColorSpace"));
+
+        // /Decode layout: [x_lo x_hi y_lo y_hi  c0_lo c0_hi  c1_lo c1_hi …].
+        // Defaults are the unit box ([0 1] per channel).
+        let pair = |base: usize| -> [f64; 2] {
+            if decode.is_empty() {
+                return [0.0, 1.0];
+            }
+            [
+                *decode.get(base).unwrap_or(&0.0),
+                *decode.get(base + 1).unwrap_or(&1.0),
+            ]
+        };
+        let coord_de = [pair(0), pair(2)];
+        let comp_de: Vec<[f64; 2]> = (0..n_components).map(|i| pair(4 + 2 * i)).collect();
+        Ok(MeshDecode {
+            bits_coord,
+            bits_comp,
+            coord_de,
+            comp_de,
+            function,
+            n_components,
+        })
+    }
+
+    /// Bits consumed by one colour record (1 for the /Function override,
+    /// else the colour-space component count).
+    pub(crate) fn comps_per_record(&self) -> usize {
+        if self.function.is_some() {
+            1
+        } else {
+            self.n_components
+        }
+    }
+
+    /// Read one colour record (byte-aligned caller): raw components or the
+    /// single /Function t input expanded into colour-space components.
+    pub(crate) fn read_comps(&self, reader: &mut BitReader<'_>) -> Result<Vec<f64>> {
+        let mut raw = Vec::with_capacity(self.comps_per_record());
+        for (i, pair) in self
+            .comp_de
+            .iter()
+            .enumerate()
+            .take(self.comps_per_record())
+        {
+            let v = reader.read_bits(self.bits_comp)?;
+            raw.push((i, map_unit(v, self.bits_comp, pair[0], pair[1])));
+        }
+        // raw holds t values when /Function is set (comp_de[0] is the t range)
+        if let Some(f) = &self.function {
+            let t = raw.first().map(|(_, v)| *v).unwrap_or(0.0);
+            return f.eval1(t).map_err(|e| {
+                PdfError::invalid_token(0, format!("mesh /Function eval failed: {e}"))
+            });
+        }
+        Ok(raw.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Read one coordinate pair through the /Decode mapping.
+    pub(crate) fn read_coord(&self, reader: &mut BitReader<'_>) -> Result<(f64, f64)> {
+        let x_raw = reader.read_bits(self.bits_coord)? as f64;
+        let y_raw = reader.read_bits(self.bits_coord)? as f64;
+        let scale = (1u64 << self.bits_coord.min(31)) as f64 - 1.0;
+        let x = self.coord_de[0][0] + x_raw / scale * (self.coord_de[0][1] - self.coord_de[0][0]);
+        let y = self.coord_de[1][0] + y_raw / scale * (self.coord_de[1][1] - self.coord_de[1][0]);
+        Ok((x, y))
+    }
+}
+
 /// Parse a Type 4 / Type 5 mesh from already-decoded stream bytes.
-pub fn parse(dict: &PdfDict, data: &[u8], shading_type: u32) -> Result<MeshShading> {
-    let bits_coord = decode_int(dict, "BitsPerCoordinate", 1, 32)?;
-    let bits_comp = decode_int(dict, "BitsPerComponent", 1, 16)?;
+pub fn parse(
+    dict: &PdfDict,
+    data: &[u8],
+    shading_type: u32,
+    function: Option<&super::ShadingFunction>,
+) -> Result<MeshShading> {
     // Flags are encoded only for Type 4 (§8.7.4.5); Type 5 has none.
     let bits_flag = if shading_type == 4 {
         decode_int(dict, "BitsPerFlag", 2, 8)?
@@ -128,47 +236,21 @@ pub fn parse(dict: &PdfDict, data: &[u8], shading_type: u32) -> Result<MeshShadi
         0
     };
 
-    let mut decode: Vec<f64> = Vec::new();
-    if let Some(PdfObject::Array(arr)) = dict.get("Decode") {
-        decode.extend(arr.iter().filter_map(obj_f64));
-    }
-
-    let n_components = cs_n_components(dict.get("ColorSpace"));
-
-    // /Decode layout: [x_lo x_hi y_lo y_hi  c0_lo c0_hi  c1_lo c1_hi …].
-    // Defaults are the unit box ([0 1] per channel).
-    let pair = |base: usize| -> [f64; 2] {
-        if decode.is_empty() {
-            return [0.0, 1.0];
-        }
-        [
-            *decode.get(base).unwrap_or(&0.0),
-            *decode.get(base + 1).unwrap_or(&1.0),
-        ]
-    };
-    let coord_de = [pair(0), pair(2)];
-    let comp_de: Vec<[f64; 2]> = (0..n_components).map(|i| pair(4 + 2 * i)).collect();
+    let ctx = MeshDecode::from_dict(dict, function.cloned())?;
 
     let mut reader = BitReader::new(data);
     let mut mesh = MeshShading {
-        n_components,
+        n_components: ctx.n_components,
         ..Default::default()
     };
     let mut ps: Vec<usize> = Vec::new();
 
-    let min_vertex_bits = 2 * bits_coord as usize + n_components * bits_comp as usize;
+    let min_vertex_bits =
+        2 * ctx.bits_coord as usize + ctx.comps_per_record() * ctx.bits_comp as usize;
 
     let read_vertex = |reader: &mut BitReader| -> Result<Vertex> {
-        let x_raw = reader.read_bits(bits_coord)? as f64;
-        let y_raw = reader.read_bits(bits_coord)? as f64;
-        let scale = (1u64 << bits_coord.min(31)) as f64 - 1.0;
-        let x = coord_de[0][0] + x_raw / scale * (coord_de[0][1] - coord_de[0][0]);
-        let y = coord_de[1][0] + y_raw / scale * (coord_de[1][1] - coord_de[1][0]);
-        let mut comps = Vec::with_capacity(n_components);
-        for pair in &comp_de {
-            let raw = reader.read_bits(bits_comp)?;
-            comps.push(map_unit(raw, bits_comp, pair[0], pair[1]));
-        }
+        let (x, y) = ctx.read_coord(reader)?;
+        let comps = ctx.read_comps(reader)?;
         Ok(Vertex { x, y, comps })
     };
 
@@ -263,7 +345,6 @@ pub fn parse(dict: &PdfDict, data: &[u8], shading_type: u32) -> Result<MeshShadi
     }
     Ok(mesh)
 }
-
 // ---------------------------------------------------------------------------
 // Rasterisation
 // ---------------------------------------------------------------------------
@@ -365,6 +446,7 @@ impl MeshShading {
 mod tests {
     use super::*;
     use crate::parser::objects::PdfObject;
+    use crate::render::shading::ShadingFunction;
 
     fn dict(entries: &[(&str, i64)]) -> PdfDict {
         entries
@@ -393,7 +475,7 @@ mod tests {
             // DeviceRGB: 2 coord bytes + 3 component bytes = 5 per vertex.
             bytes.extend_from_slice(&[x, y, x, x, x]);
         }
-        let mesh = parse(&d, &bytes, 5).expect("lattice parses");
+        let mesh = parse(&d, &bytes, 5, None).expect("lattice parses");
         assert_eq!(mesh.vertices.len(), 6);
         assert_eq!(mesh.triangles.len(), 4);
     }
@@ -422,7 +504,7 @@ mod tests {
         push(&mut bytes, 0, 5);
         push(&mut bytes, 1, 15);
         push(&mut bytes, 2, 20);
-        let mesh = parse(&d, &bytes, 4).expect("type-4 parses");
+        let mesh = parse(&d, &bytes, 4, None).expect("type-4 parses");
         assert_eq!(mesh.vertices.len(), 5);
         // (0,1,2) fresh; (1,2,3) shares P1–P2; (1,3,4) shares P0–P2.
         assert_eq!(mesh.triangles, vec![[0, 1, 2], [1, 2, 3], [1, 3, 4]]);
@@ -441,7 +523,7 @@ mod tests {
             PdfObject::Name("DeviceGray".to_string()),
         );
         let bytes = vec![0u8, 0u8]; // partial vertex
-        assert!(parse(&d, &bytes, 4).is_err());
+        assert!(parse(&d, &bytes, 4, None).is_err());
     }
 
     #[test]
@@ -457,7 +539,7 @@ mod tests {
             PdfObject::Name("DeviceGray".to_string()),
         );
         let bytes = vec![7u8, 0, 0, 0];
-        assert!(parse(&d, &bytes, 4).is_err());
+        assert!(parse(&d, &bytes, 4, None).is_err());
     }
 
     #[test]
@@ -467,7 +549,36 @@ mod tests {
             ("BitsPerCoordinate", 8),
             ("BitsPerComponent", 8),
         ]);
-        assert!(parse(&d, &[0, 0, 0, 0, 0], 5).is_err());
+        assert!(parse(&d, &[0, 0, 0, 0, 0], 5, None).is_err());
+    }
+
+    #[test]
+    fn function_override_expands_t_to_components() {
+        // §8.7.4.4 /Function override: colour records carry one t value
+        // expanded through the function. Exponential f(t) = C0 + t^N·(C1−C0)
+        // with C0=0, C1=1, N=1 → comps = [t].
+        let mut d = dict(&[
+            ("ShadingType", 4),
+            ("BitsPerFlag", 8),
+            ("BitsPerCoordinate", 8),
+            ("BitsPerComponent", 8),
+        ]);
+        d.insert(
+            "ColorSpace".to_string(),
+            PdfObject::Name("DeviceGray".to_string()),
+        );
+        let function = ShadingFunction::Exponential {
+            c0: vec![0.0],
+            c1: vec![1.0],
+            n: 1.0,
+        };
+        // Two flag-0 vertices: (0,0) with t=51 (→ 0.2), (10,10) with
+        // t=153 (→ 0.6). One coord byte ×2 + one t byte per record.
+        let bytes = vec![0u8, 0, 0, 51, 0, 10, 10, 153];
+        let mesh = parse(&d, &bytes, 4, Some(&function)).expect("type-4 + fn parses");
+        assert_eq!(mesh.vertices.len(), 2);
+        assert_eq!(mesh.vertices[0].comps, vec![51.0 / 255.0]);
+        assert_eq!(mesh.vertices[1].comps, vec![153.0 / 255.0]);
     }
 
     fn identity() -> Matrix {
