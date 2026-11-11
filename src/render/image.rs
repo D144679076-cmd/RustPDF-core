@@ -32,8 +32,32 @@ pub fn decode_image(
 ) -> Result<RgbaImage> {
     match filter_hint {
         Some("DCTDecode") => decode_jpeg(raw, width, height),
+        Some("JPXDecode") => decode_jpx(raw),
         _ => decode_raw(raw, width, height, color_space, bits_per_component),
     }
+}
+
+/// Decode a JPEG 2000 stream (`/JPXDecode`) into RGBA. The codestream's own
+/// SIZ header supplies the dimensions and component count, so the PDF
+/// dictionary's width/height are only used as a sanity check.
+fn decode_jpx(raw: &[u8]) -> Result<RgbaImage> {
+    let img = crate::parser::jpx::decode(raw)?;
+    let (w, h, n, interleaved) = img.interleaved_u8();
+    if n >= 4 {
+        log::warn!("JPX image with {n} components; using first 4 (CMYK order assumed)");
+    }
+    if w == 0 || h == 0 {
+        return Ok(RgbaImage {
+            data: Vec::new(),
+            width: 0,
+            height: 0,
+        });
+    }
+    Ok(RgbaImage {
+        data: expand_to_rgba(&interleaved, w, h, n),
+        width: w,
+        height: h,
+    })
 }
 
 // ---------------------------------------------------------------------------
