@@ -196,6 +196,10 @@ pub enum BlendMode {
     SoftLight,
     Difference,
     Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -219,6 +223,10 @@ impl BlendMode {
             "SoftLight" => BlendMode::SoftLight,
             "Difference" => BlendMode::Difference,
             "Exclusion" => BlendMode::Exclusion,
+            "Hue" => BlendMode::Hue,
+            "Saturation" => BlendMode::Saturation,
+            "Color" => BlendMode::Color,
+            "Luminosity" => BlendMode::Luminosity,
             _ => BlendMode::Normal,
         }
     }

@@ -130,24 +130,51 @@ impl PixmapBuffer {
                 BlendMode::Screen => (sr + dr - sr * dr, sg + dg - sg * dg, sb + db - sb * db),
                 BlendMode::Darken => (sr.min(dr), sg.min(dg), sb.min(db)),
                 BlendMode::Lighten => (sr.max(dr), sg.max(dg), sb.max(db)),
-                BlendMode::Overlay => (
-                    if dr < 0.5 {
-                        2.0 * sr * dr
-                    } else {
-                        1.0 - 2.0 * (1.0 - sr) * (1.0 - dr)
-                    },
-                    if dg < 0.5 {
-                        2.0 * sg * dg
-                    } else {
-                        1.0 - 2.0 * (1.0 - sg) * (1.0 - dg)
-                    },
-                    if db < 0.5 {
-                        2.0 * sb * db
-                    } else {
-                        1.0 - 2.0 * (1.0 - sb) * (1.0 - db)
-                    },
+                BlendMode::Overlay => {
+                    // Overlay(Cb,Cs) == HardLight(Cs,Cb) — roles swapped.
+                    (
+                        blend_hard_light(sr, dr),
+                        blend_hard_light(sg, dg),
+                        blend_hard_light(sb, db),
+                    )
+                }
+                BlendMode::ColorDodge => (
+                    blend_color_dodge(dr, sr),
+                    blend_color_dodge(dg, sg),
+                    blend_color_dodge(db, sb),
                 ),
-                _ => (sr, sg, sb),
+                BlendMode::ColorBurn => (
+                    blend_color_burn(dr, sr),
+                    blend_color_burn(dg, sg),
+                    blend_color_burn(db, sb),
+                ),
+                BlendMode::HardLight => (
+                    blend_hard_light(dr, sr),
+                    blend_hard_light(dg, sg),
+                    blend_hard_light(db, sb),
+                ),
+                BlendMode::SoftLight => (
+                    blend_soft_light(dr, sr),
+                    blend_soft_light(dg, sg),
+                    blend_soft_light(db, sb),
+                ),
+                BlendMode::Difference => ((dr - sr).abs(), (dg - sg).abs(), (db - sb).abs()),
+                BlendMode::Exclusion => (
+                    dr + sr - 2.0 * dr * sr,
+                    dg + sg - 2.0 * dg * sg,
+                    db + sb - 2.0 * db * sb,
+                ),
+                BlendMode::Hue => {
+                    let c = set_sat((sr, sg, sb), sat((dr, dg, db)));
+                    set_lum(c, lum((dr, dg, db)))
+                }
+                BlendMode::Saturation => {
+                    let c = set_sat((dr, dg, db), sat((sr, sg, sb)));
+                    set_lum(c, lum((dr, dg, db)))
+                }
+                BlendMode::Color => set_lum((sr, sg, sb), lum((dr, dg, db))),
+                BlendMode::Luminosity => set_lum((dr, dg, db), lum((sr, sg, sb))),
+                BlendMode::Normal => (sr, sg, sb),
             };
 
             // Porter-Duff source-over in straight space
@@ -208,6 +235,117 @@ impl PixmapBuffer {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blend-mode functions — ISO 32000-1 §11.3.5
+// ---------------------------------------------------------------------------
+
+/// Separable modes operate component-wise; `cb` is the backdrop component
+/// (destination), `cs` the source component.
+
+fn blend_hard_light(cb: f32, cs: f32) -> f32 {
+    if cs <= 0.5 {
+        // Multiply-like on the dark half
+        cb * 2.0 * cs
+    } else {
+        // Screen-like on the light half
+        cb + 2.0 * cs - 1.0 - cb * (2.0 * cs - 1.0)
+    }
+}
+
+fn blend_color_dodge(cb: f32, cs: f32) -> f32 {
+    if cb <= 0.0 {
+        0.0
+    } else if cs >= 1.0 {
+        1.0
+    } else {
+        (cb / (1.0 - cs)).min(1.0)
+    }
+}
+
+fn blend_color_burn(cb: f32, cs: f32) -> f32 {
+    if cb >= 1.0 {
+        1.0
+    } else if cs <= 0.0 {
+        0.0
+    } else {
+        1.0 - ((1.0 - cb) / cs).min(1.0)
+    }
+}
+
+fn blend_soft_light(cb: f32, cs: f32) -> f32 {
+    if cs <= 0.5 {
+        cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+    } else {
+        let d = if cb <= 0.25 {
+            ((16.0 * cb - 12.0) * cb + 4.0) * cb
+        } else {
+            cb.sqrt()
+        };
+        cb + (2.0 * cs - 1.0) * (d - cb)
+    }
+}
+
+/// Luminance of a straight RGB triple (spec weights 0.3 / 0.59 / 0.11).
+fn lum(c: (f32, f32, f32)) -> f32 {
+    0.3 * c.0 + 0.59 * c.1 + 0.11 * c.2
+}
+
+/// Saturation = max component − min component.
+fn sat(c: (f32, f32, f32)) -> f32 {
+    c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2)
+}
+
+/// Clip components back into the gamut after a luminance shift, per spec:
+/// scale the chroma toward the luminance axis so min ≥ 0 and max ≤ 1.
+fn clip_color(c: (f32, f32, f32)) -> (f32, f32, f32) {
+    let l = lum(c);
+    let n = c.0.min(c.1).min(c.2);
+    let x = c.0.max(c.1).max(c.2);
+    let mut c = c;
+    if n < 0.0 && l - n != 0.0 {
+        c = (
+            l + (c.0 - l) * l / (l - n),
+            l + (c.1 - l) * l / (l - n),
+            l + (c.2 - l) * l / (l - n),
+        );
+    }
+    let l = lum(c);
+    let x = c.0.max(c.1).max(c.2);
+    if x > 1.0 && x - l != 0.0 {
+        c = (
+            l + (c.0 - l) * (1.0 - l) / (x - l),
+            l + (c.1 - l) * (1.0 - l) / (x - l),
+            l + (c.2 - l) * (1.0 - l) / (x - l),
+        );
+    }
+    c
+}
+
+/// Shift a colour's luminance to `l`, preserving hue and saturation.
+fn set_lum(c: (f32, f32, f32), l: f32) -> (f32, f32, f32) {
+    let d = l - lum(c);
+    clip_color((c.0 + d, c.1 + d, c.2 + d))
+}
+
+/// Rescale a colour's saturation to `s`, preserving hue and luminance.
+/// The smallest component becomes 0 and the largest becomes `s`.
+fn set_sat(c: (f32, f32, f32), s: f32) -> (f32, f32, f32) {
+    let arr = [c.0, c.1, c.2];
+    let mut idx = [0usize, 1, 2];
+    idx.sort_by(|&a, &b| {
+        arr[a]
+            .partial_cmp(&arr[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (mn, md, mx) = (arr[idx[0]], arr[idx[1]], arr[idx[2]]);
+    let mut out = [0.0f32; 3];
+    if mx > mn {
+        out[idx[1]] = s * (md - mn) / (mx - mn);
+        out[idx[2]] = s;
+    }
+    (out[0], out[1], out[2])
 }
 
 // ---------------------------------------------------------------------------
@@ -334,5 +472,160 @@ mod tests {
             "multiply blend should darken: got {}",
             result[0]
         );
+    }
+
+    /// Composite two opaque 1×1 pixels with `mode` and return the result.
+    fn blend_1x1(dst_px: [u8; 4], src_px: [u8; 4], mode: BlendMode) -> [u8; 4] {
+        let mut dst = PixmapBuffer::new(1, 1).unwrap();
+        {
+            let d = dst.inner.data_mut();
+            d.copy_from_slice(&dst_px);
+        }
+        let mut src = PixmapBuffer::new_transparent(1, 1, TileOrigin { x: 0, y: 0 }).unwrap();
+        {
+            let d = src.inner.data_mut();
+            d.copy_from_slice(&src_px);
+        }
+        dst.composite_over(&src, 1.0, mode);
+        let r = dst.data();
+        [r[0], r[1], r[2], r[3]]
+    }
+
+    #[test]
+    fn blend_difference_red_blue_is_magenta() {
+        let out = blend_1x1([255, 0, 0, 255], [0, 0, 255, 255], BlendMode::Difference);
+        assert_eq!(out, [255, 0, 255, 255]);
+    }
+
+    #[test]
+    fn blend_exclusion_mid_gray_stays_mid_gray() {
+        let out = blend_1x1(
+            [128, 128, 128, 255],
+            [128, 128, 128, 255],
+            BlendMode::Exclusion,
+        );
+        // 0.502 + 0.502 − 2·0.502² ≈ 0.5 → ~128
+        assert!(out[0] > 115 && out[0] < 140, "got {}", out[0]);
+    }
+
+    #[test]
+    fn blend_color_dodge_scales_by_one_minus_source() {
+        // cb = 64/255 ≈ 0.251, cs = 0.5 → 0.251/0.5 ≈ 0.502 → ~128
+        let out = blend_1x1(
+            [64, 64, 64, 255],
+            [128, 128, 128, 255],
+            BlendMode::ColorDodge,
+        );
+        assert!(out[0] > 115 && out[0] < 140, "got {}", out[0]);
+    }
+
+    #[test]
+    fn blend_color_dodge_zero_backdrop_stays_zero() {
+        let out = blend_1x1([0, 0, 0, 255], [128, 128, 128, 255], BlendMode::ColorDodge);
+        assert_eq!(out, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn blend_color_burn_full_source_is_backdrop() {
+        // cs = 1 → 1 − (1−cb)/1 = cb
+        let out = blend_1x1(
+            [128, 128, 128, 255],
+            [255, 255, 255, 255],
+            BlendMode::ColorBurn,
+        );
+        assert!(out[0] > 115 && out[0] < 140, "got {}", out[0]);
+    }
+
+    #[test]
+    fn blend_color_burn_full_backdrop_stays_white() {
+        let out = blend_1x1(
+            [255, 255, 255, 255],
+            [128, 128, 128, 255],
+            BlendMode::ColorBurn,
+        );
+        assert_eq!(out, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn blend_hard_light_screen_half() {
+        // cb ≈ 0.251, cs ≈ 0.749 → screen: cb + (2cs−1)(1−cb) ≈ 0.624 → ~159
+        let out = blend_1x1(
+            [64, 64, 64, 255],
+            [191, 191, 191, 255],
+            BlendMode::HardLight,
+        );
+        assert!(out[0] > 145 && out[0] < 175, "got {}", out[0]);
+    }
+
+    #[test]
+    fn blend_soft_light_dark_source_darkens() {
+        // cb ≈ 0.502, cs ≈ 0.251 → cb − (1−2cs)·cb·(1−cb) ≈ 0.378 → ~96
+        let out = blend_1x1(
+            [128, 128, 128, 255],
+            [64, 64, 64, 255],
+            BlendMode::SoftLight,
+        );
+        assert!(out[0] > 85 && out[0] < 108, "got {}", out[0]);
+    }
+
+    #[test]
+    fn blend_luminosity_gray_over_red() {
+        // lum(gray)=0.5 shifted into red's chroma: clip to (1, ~0.286, ~0.286)
+        let out = blend_1x1(
+            [255, 0, 0, 255],
+            [128, 128, 128, 255],
+            BlendMode::Luminosity,
+        );
+        assert!(out[0] > 240, "r got {}", out[0]);
+        assert!(out[1] > 60 && out[1] < 90, "g got {}", out[1]);
+        assert!(out[2] > 60 && out[2] < 90, "b got {}", out[2]);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn blend_color_gray_over_red_uses_backdrop_luminance() {
+        // Color(Cb,Cs) = SetLum(Cs, Lum(Cb)): gray source at red's luminance 0.3 → ~77
+        let out = blend_1x1([255, 0, 0, 255], [128, 128, 128, 255], BlendMode::Color);
+        assert!(out[0] > 65 && out[0] < 90, "got {}", out[0]);
+        assert_eq!(out[1], out[0]);
+        assert_eq!(out[2], out[0]);
+    }
+
+    #[test]
+    fn blend_hue_blue_over_red() {
+        // Hue: blue's hue with red's saturation and luminosity → (≈0.21, ≈0.21, 1)
+        let out = blend_1x1([255, 0, 0, 255], [0, 0, 255, 255], BlendMode::Hue);
+        assert_eq!(out[2], 255, "b got {}", out[2]);
+        assert!(out[0] > 40 && out[0] < 70, "r got {}", out[0]);
+        assert_eq!(out[1], out[0]);
+    }
+
+    #[test]
+    fn blend_saturation_zero_source_desaturates_backdrop() {
+        // Saturation: gray backdrop has 0 saturation → black, then gray's luminance → ~128
+        let out = blend_1x1(
+            [128, 128, 128, 255],
+            [255, 0, 0, 255],
+            BlendMode::Saturation,
+        );
+        assert!(out[0] > 115 && out[0] < 140, "got {}", out[0]);
+        assert_eq!(out[1], out[0]);
+        assert_eq!(out[2], out[0]);
+    }
+
+    #[test]
+    fn blend_mode_from_name_parses_all_non_separable() {
+        use crate::content::graphics_state::BlendMode;
+        assert_eq!(BlendMode::from_name("Hue"), BlendMode::Hue);
+        assert_eq!(BlendMode::from_name("Saturation"), BlendMode::Saturation);
+        assert_eq!(BlendMode::from_name("Color"), BlendMode::Color);
+        assert_eq!(BlendMode::from_name("Luminosity"), BlendMode::Luminosity);
+        assert_eq!(BlendMode::from_name("ColorDodge"), BlendMode::ColorDodge);
+        assert_eq!(BlendMode::from_name("ColorBurn"), BlendMode::ColorBurn);
+        assert_eq!(BlendMode::from_name("HardLight"), BlendMode::HardLight);
+        assert_eq!(BlendMode::from_name("SoftLight"), BlendMode::SoftLight);
+        assert_eq!(BlendMode::from_name("Difference"), BlendMode::Difference);
+        assert_eq!(BlendMode::from_name("Exclusion"), BlendMode::Exclusion);
+        assert_eq!(BlendMode::from_name("Bogus"), BlendMode::Normal);
     }
 }
