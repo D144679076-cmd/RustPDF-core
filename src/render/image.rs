@@ -5,6 +5,7 @@
 //! DCTDecode (JPEG) via `zune-jpeg`.  Other filters produce a gray placeholder.
 
 use crate::error::{PdfError, Result};
+use crate::parser::objects::{PdfDict, PdfObject};
 
 /// Decoded image ready for blitting into a `PixmapBuffer`.
 pub struct RgbaImage {
@@ -381,6 +382,146 @@ pub fn apply_smask(rgba: &mut [u8], smask: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
+// Hard /Mask (stencil + chroma-key) — ISO 32000-1 §8.9.6.4
+// ---------------------------------------------------------------------------
+
+fn obj_int(o: &PdfObject) -> Option<i64> {
+    match o {
+        PdfObject::Integer(n) => Some(*n),
+        PdfObject::Real(r) => Some(*r as i64),
+        _ => None,
+    }
+}
+
+fn dict_int(dict: &PdfDict, key: &str) -> Option<i64> {
+    dict.get(key).and_then(obj_int)
+}
+
+/// Decode a hard `/Mask` stream — an image XObject used as the `/Mask` entry
+/// of another image — into a single-channel alpha vector (255 = base image
+/// visible, 0 = hidden) plus the mask's encoded dimensions.
+///
+/// Per §8.9.6.4 a mask sample value of 0 marks areas that shall be painted,
+/// so the alpha is the inverted sample (`alpha = 255 - sample`); a
+/// `/Decode [1 0]` array reverses the mapping. Supported encodings: 1-bit
+/// packed stencil masks and 8-bit gray masks.
+///
+/// `raw` is the fully decoded (defiltered, decrypted) mask sample data.
+pub fn decode_hard_mask(raw: &[u8], dict: &PdfDict) -> Option<(Vec<u8>, u32, u32)> {
+    let w = dict_int(dict, "Width").unwrap_or(0).max(0) as u32;
+    let h = dict_int(dict, "Height").unwrap_or(0).max(0) as u32;
+    if w == 0 || h == 0 {
+        log::warn!("/Mask stream has zero dimensions; ignoring");
+        return None;
+    }
+    let bpc = dict_int(dict, "BitsPerComponent").unwrap_or(1) as u8;
+    // /Decode [1 0] swaps the sample mapping (sample 1 → paint).
+    let inverted = match dict.get("Decode") {
+        Some(PdfObject::Array(arr)) if arr.len() >= 2 => match &arr[0] {
+            PdfObject::Integer(n) => *n != 0,
+            PdfObject::Real(r) => *r != 0.0,
+            _ => false,
+        },
+        _ => false,
+    };
+    let n = (w as usize) * (h as usize);
+    let samples: Vec<u8> = match bpc {
+        1 => unpack_1bit_samples(raw, w, h),
+        8 => {
+            let mut s = vec![0u8; n];
+            let copy = raw.len().min(n);
+            s[..copy].copy_from_slice(&raw[..copy]);
+            s
+        }
+        other => {
+            log::warn!("/Mask with {} bpc is unsupported; ignoring", other);
+            return None;
+        }
+    };
+    let alpha: Vec<u8> = if inverted {
+        samples
+    } else {
+        samples.iter().map(|&v| 255 - v).collect()
+    };
+    Some((alpha, w, h))
+}
+
+/// Expand a 1-bit packed mask stream into 0/255 sample values (MSB first,
+/// rows padded to byte boundaries — §8.9.6.2). Missing bytes decode as 0.
+fn unpack_1bit_samples(raw: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let row_bytes = (w as usize).div_ceil(8);
+    let mut out = vec![0u8; (w as usize) * (h as usize)];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            let byte_idx = row * row_bytes + col / 8;
+            let bit = if byte_idx < raw.len() {
+                (raw[byte_idx] >> (7 - (col % 8))) & 1
+            } else {
+                0
+            };
+            out[row * w as usize + col] = if bit != 0 { 255 } else { 0 };
+        }
+    }
+    out
+}
+
+/// Chroma-key `/Mask` array form (ISO 32000-1 §8.9.6.4): each `[min max]`
+/// pair gives an inclusive range for one colour component; a pixel whose
+/// every component sample falls inside its range is masked out (hidden).
+///
+/// `raw` holds 8-bit samples in `channels`-component interleaved order at
+/// `w × h`. Returns the alpha vector (255 = visible) or `None` for
+/// malformed ranges. Values are compared against the decoded component
+/// samples (after indexed-palette expansion when applicable).
+pub fn decode_chroma_key(
+    raw: &[u8],
+    w: u32,
+    h: u32,
+    channels: usize,
+    ranges: &[PdfObject],
+) -> Option<Vec<u8>> {
+    if ranges.is_empty() || !ranges.len().is_multiple_of(2) {
+        log::warn!(
+            "/Mask array length {} is not a set of [min max] pairs",
+            ranges.len()
+        );
+        return None;
+    }
+    let pairs = ranges.len() / 2;
+    if pairs > channels {
+        log::warn!(
+            "/Mask array has {} ranges for {} components",
+            pairs,
+            channels
+        );
+        return None;
+    }
+    let mut lo_hi = Vec::with_capacity(pairs);
+    for pair in ranges.chunks(2) {
+        let lo = obj_int(&pair[0])?;
+        let hi = obj_int(&pair[1])?;
+        lo_hi.push((lo.min(hi), lo.max(hi)));
+    }
+    let npix = (w as usize) * (h as usize);
+    let mut alpha = vec![255u8; npix];
+    for (px, a) in alpha.iter_mut().enumerate() {
+        let base = px * channels;
+        let mut hide = true;
+        for (c, &(lo, hi)) in lo_hi.iter().enumerate() {
+            let s = raw.get(base + c).copied().unwrap_or(0) as i64;
+            if s < lo || s > hi {
+                hide = false;
+                break;
+            }
+        }
+        if hide {
+            *a = 0;
+        }
+    }
+    Some(alpha)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -481,5 +622,118 @@ mod tests {
         assert_eq!(rgba[3], 128);
         // RGB unchanged
         assert_eq!(&rgba[0..3], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn unpack_1bit_samples_expands_msb_first_with_row_padding() {
+        // 3 px wide (row_bytes = 1): bits 1,0,1 in row 0.
+        let raw = [0b1010_0000u8];
+        let out = unpack_1bit_samples(&raw, 3, 1);
+        assert_eq!(out, vec![255, 0, 255]);
+    }
+
+    #[test]
+    fn unpack_1bit_samples_missing_bytes_decode_as_zero() {
+        let out = unpack_1bit_samples(&[], 2, 2);
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn hard_mask_stencil_inverts_sample_per_spec() {
+        // §8.9.6.4: mask sample 0 → paint (alpha 255), 1 → hide (alpha 0).
+        let mut dict = PdfDict::new();
+        dict.insert("Width".to_string(), PdfObject::Integer(2));
+        dict.insert("Height".to_string(), PdfObject::Integer(1));
+        dict.insert("BitsPerComponent".to_string(), PdfObject::Integer(1));
+        // bit 1 then bit 0 (MSB first)
+        let raw = [0b1000_0000u8];
+        let (alpha, w, h) = decode_hard_mask(&raw, &dict).expect("decode succeeds");
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(alpha, vec![0, 255]);
+    }
+
+    #[test]
+    fn hard_mask_decode_10_reverses_mapping() {
+        let mut dict = PdfDict::new();
+        dict.insert("Width".to_string(), PdfObject::Integer(2));
+        dict.insert("Height".to_string(), PdfObject::Integer(1));
+        dict.insert("BitsPerComponent".to_string(), PdfObject::Integer(1));
+        dict.insert(
+            "Decode".to_string(),
+            PdfObject::Array(vec![PdfObject::Integer(1), PdfObject::Integer(0)]),
+        );
+        let raw = [0b1000_0000u8];
+        let (alpha, _, _) = decode_hard_mask(&raw, &dict).expect("decode succeeds");
+        assert_eq!(alpha, vec![255, 0]);
+    }
+
+    #[test]
+    fn hard_mask_8bit_gray() {
+        let mut dict = PdfDict::new();
+        dict.insert("Width".to_string(), PdfObject::Integer(2));
+        dict.insert("Height".to_string(), PdfObject::Integer(1));
+        dict.insert("BitsPerComponent".to_string(), PdfObject::Integer(8));
+        let (alpha, _, _) = decode_hard_mask(&[0u8, 255], &dict).expect("decode succeeds");
+        assert_eq!(alpha, vec![255, 0]);
+    }
+
+    #[test]
+    fn hard_mask_zero_dimensions_rejected() {
+        let dict = PdfDict::new();
+        assert!(decode_hard_mask(&[], &dict).is_none());
+    }
+
+    #[test]
+    fn hard_mask_unsupported_bpc_rejected() {
+        let mut dict = PdfDict::new();
+        dict.insert("Width".to_string(), PdfObject::Integer(2));
+        dict.insert("Height".to_string(), PdfObject::Integer(1));
+        dict.insert("BitsPerComponent".to_string(), PdfObject::Integer(4));
+        assert!(decode_hard_mask(&[0x12], &dict).is_none());
+    }
+
+    #[test]
+    fn chroma_key_hides_pixels_inside_all_ranges() {
+        // RGB samples: pure red, pure green, pure red.
+        let raw = [255u8, 0, 0, 0, 255, 0, 255, 0, 0];
+        let ranges = [
+            PdfObject::Integer(250),
+            PdfObject::Integer(255),
+            PdfObject::Integer(0),
+            PdfObject::Integer(5),
+            PdfObject::Integer(0),
+            PdfObject::Integer(5),
+        ];
+        let alpha = decode_chroma_key(&raw, 3, 1, 3, &ranges).expect("decode succeeds");
+        // Red pixels fall inside all three ranges → hidden; green survives.
+        assert_eq!(alpha, vec![0, 255, 0]);
+    }
+
+    #[test]
+    fn chroma_key_partial_range_keeps_pixel() {
+        // Gray samples where only the first component is ranged.
+        let raw = [10u8, 200];
+        let ranges = [PdfObject::Integer(0), PdfObject::Integer(10)];
+        let alpha = decode_chroma_key(&raw, 2, 1, 1, &ranges).expect("decode succeeds");
+        assert_eq!(alpha, vec![0, 255]);
+    }
+
+    #[test]
+    fn chroma_key_odd_length_rejected() {
+        let raw = [0u8, 0, 0];
+        let ranges = [PdfObject::Integer(0)];
+        assert!(decode_chroma_key(&raw, 1, 1, 3, &ranges).is_none());
+    }
+
+    #[test]
+    fn chroma_key_more_ranges_than_channels_rejected() {
+        let raw = [0u8];
+        let ranges = [
+            PdfObject::Integer(0),
+            PdfObject::Integer(255),
+            PdfObject::Integer(0),
+            PdfObject::Integer(255),
+        ];
+        assert!(decode_chroma_key(&raw, 1, 1, 1, &ranges).is_none());
     }
 }

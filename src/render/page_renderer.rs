@@ -32,7 +32,10 @@ use super::canvas::{PixmapBuffer, TileOrigin};
 use super::color::color_to_rgba;
 use super::font_resolver::{normalize_font_name, EmbeddedFontResolver, FontResolver};
 use super::glyph_cache::{FontBytesCache, GlyphCache, RenderCache};
-use super::image::{apply_smask, decode_image, decode_image_cached, scale_gray_mask};
+use super::image::{
+    apply_smask, decode_chroma_key, decode_hard_mask, decode_image, decode_image_cached,
+    scale_gray_mask,
+};
 use super::path_render::{build_skia_path, fill_path_with_rule, matrix_to_transform, stroke_path};
 use super::shading::Shading;
 use super::tile::TileRect;
@@ -417,11 +420,11 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
         if span.is_type3 {
             return;
         }
-        // Soft mask on text is not yet composited through a temp canvas (Phase 3).
-        // Text appears unmasked, which is incorrect but better than invisible.
-        if self.current_soft_mask.is_some() {
-            log::debug!("[smask] soft mask ignored for text span (Phase 3 follow-up)");
-        }
+        // Soft mask under text (ISO 32000-1 §11.6.5.2): when an ExtGState
+        // /SMask is active the glyphs are painted into a transparent temp
+        // canvas below, the mask multiplies the temp alpha, and the result is
+        // composited over the page — the same masked-composite path used by
+        // stroke/fill.
         // span.x, span.y are already in tile-local pixel space because the
         // initial CTM (with Y-flip and tile offset) was applied to the interpreter
         // before content stream execution began.
@@ -519,9 +522,23 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
         // `embedded_bytes_ref` holds an immutable borrow of `font_bytes_cache`.
         // `gc`, `cv`, and `sk` hold exclusive borrows of the three other fields.
         // Rust tracks disjoint field borrows, so all four coexist legally.
+        //
+        // With an active soft mask, `cv` points at the temp canvas instead of
+        // the page; the mask is applied and composited after the loop below.
         let embedded_bytes_ref: Option<&[u8]> = self.font_bytes_cache.get(&span.font_name);
         let gc = &mut self.glyph_cache;
-        let cv = &mut self.canvas;
+        let mut mask_temp: Option<PixmapBuffer> = None;
+        if self.current_soft_mask.is_some() {
+            let (w, h, origin) = (self.canvas.width, self.canvas.height, self.canvas.origin);
+            match PixmapBuffer::new_transparent(w, h, origin) {
+                Ok(t) => mask_temp = Some(t),
+                Err(e) => log::warn!("soft-mask temp canvas alloc failed: {}", e),
+            }
+        }
+        let cv: &mut PixmapBuffer = match mask_temp.as_mut() {
+            Some(t) => t,
+            None => &mut self.canvas,
+        };
         let sk = &mut self.blit_scratch;
 
         for (i, ch) in span.text.chars().enumerate() {
@@ -657,6 +674,16 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
             //           pen_after=({:.1},{:.1})", ch, advance_x,
             //           span.char_advances_y.first().copied().unwrap_or(0.0), pen_x, pen_y);
             //   }
+        }
+
+        // Soft-mask composite: glyphs painted into `mask_temp` (when allocated
+        // above) get the ExtGState /SMask applied and are then composited over
+        // the page canvas.
+        if let Some(mut temp) = mask_temp {
+            if let Some(ref mask) = self.current_soft_mask {
+                Self::apply_canvas_soft_mask(mask, &mut temp);
+            }
+            self.canvas.composite_over(&temp, 1.0, BlendMode::Normal);
         }
     }
 
@@ -877,6 +904,90 @@ impl<'doc> OutputDevice for PageRenderer<'doc> {
                 }
                 Ok(_) => log::warn!("SMask entry is not a stream, skipping"),
                 Err(e) => log::warn!("SMask resolve failed: {}", e),
+            }
+        }
+
+        // Hard /Mask (ISO 32000-1 §8.9.6.4): a stencil-mask stream (sample 0
+        // paints the base image, 1 hides it) or a chroma-key colour-range
+        // array. Applied only when no /SMask produced the alpha channel —
+        // the two forms are mutually exclusive in practice.
+        if masked.is_none() {
+            if let Some(mask_obj) = dict.get("Mask") {
+                match self.doc.resolve(mask_obj) {
+                    Ok(PdfObject::Stream(mask_stream)) => {
+                        // For encrypted PDFs the mask stream must be decrypted
+                        // before defiltering, same as the SMask path above.
+                        let m_decrypted = match mask_obj {
+                            PdfObject::Reference(mid, _) => self.doc.get_stream_data(*mid).ok(),
+                            _ => None,
+                        };
+                        let m_raw = m_decrypted
+                            .map(Ok)
+                            .unwrap_or_else(|| mask_stream.decode_with_doc(self.doc));
+                        match m_raw {
+                            Ok(mr) => {
+                                if let Some((alpha, mw, mh)) =
+                                    decode_hard_mask(&mr, &mask_stream.dict)
+                                {
+                                    let alpha = if mw == iw && mh == ih {
+                                        alpha
+                                    } else {
+                                        log::debug!(
+                                            "/Mask {}×{} rescaled to match image {}×{}",
+                                            mw,
+                                            mh,
+                                            iw,
+                                            ih
+                                        );
+                                        scale_gray_mask(&alpha, mw, mh, iw, ih)
+                                    };
+                                    let mut data = img.data.clone();
+                                    apply_smask(&mut data, &alpha);
+                                    masked = Some(data);
+                                }
+                            }
+                            Err(e) => log::warn!("/Mask stream decode failed: {}", e),
+                        }
+                    }
+                    Ok(PdfObject::Array(ranges)) => {
+                        // Chroma-key array form: values are compared against
+                        // the decoded component samples (post indexed-palette
+                        // expansion), so only 8 bpc simple colour spaces work.
+                        let channels: usize = match cs_name {
+                            "DeviceGray" | "CalGray" => 1,
+                            "DeviceRGB" | "CalRGB" | "sRGB" => 3,
+                            "DeviceCMYK" => 4,
+                            _ => {
+                                log::warn!(
+                                    "chroma-key /Mask unsupported for color space {}",
+                                    cs_name
+                                );
+                                0
+                            }
+                        };
+                        if channels == 0 {
+                            // Already warned above.
+                        } else if effective_bpc != 8 {
+                            log::warn!(
+                                "chroma-key /Mask requires 8 bpc (got {}); ignoring",
+                                effective_bpc
+                            );
+                        } else if let Some(alpha) =
+                            decode_chroma_key(&raw, width, height, channels, &ranges)
+                        {
+                            let alpha = if width == iw && height == ih {
+                                alpha
+                            } else {
+                                scale_gray_mask(&alpha, width, height, iw, ih)
+                            };
+                            let mut data = img.data.clone();
+                            apply_smask(&mut data, &alpha);
+                            masked = Some(data);
+                        }
+                    }
+                    Ok(_) => log::warn!("/Mask entry is neither stream nor array; ignoring"),
+                    Err(e) => log::warn!("/Mask resolve failed: {}", e),
+                }
             }
         }
 
