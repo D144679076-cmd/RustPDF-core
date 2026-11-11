@@ -302,7 +302,6 @@ fn sat(c: (f32, f32, f32)) -> f32 {
 fn clip_color(c: (f32, f32, f32)) -> (f32, f32, f32) {
     let l = lum(c);
     let n = c.0.min(c.1).min(c.2);
-    let x = c.0.max(c.1).max(c.2);
     let mut c = c;
     if n < 0.0 && l - n != 0.0 {
         c = (
