@@ -47,6 +47,14 @@ pub fn decode(data: &[u8], parms: Option<&PdfDict>) -> Result<Vec<u8>> {
 
 /// Decode with pre-parsed parameters (see [`FaxParms`]).
 pub fn decode_with(data: &[u8], p: &FaxParms) -> Result<Vec<u8>> {
+    decode_with_consumed(data, p).map(|(bytes, _)| bytes)
+}
+
+/// Decode with pre-parsed parameters; also returns the number of source
+/// bytes consumed from `data` (used by JBIG2 MMR glue, where several
+/// bitplanes share one stream and the caller must resume at the right
+/// offset).
+pub fn decode_with_consumed(data: &[u8], p: &FaxParms) -> Result<(Vec<u8>, usize)> {
     let stride = p.columns.div_ceil(8) as usize;
     let target = if p.rows > 0 {
         let t = p.rows as usize * stride;
@@ -69,6 +77,18 @@ pub fn decode_with(data: &[u8], p: &FaxParms) -> Result<Vec<u8>> {
             None => break,
         }
     }
+    // pdf.js `decodeMMRBitmap` (endOfBlock=true) reads up to 5 further
+    // chars after the last row to flush the EOFB code. The bytes are
+    // discarded, but the input position must advance so callers that share
+    // one MMR stream (JBIG2 halftone gray-scale planes) resume at the
+    // correct offset.
+    if p.eoblock {
+        for _ in 0..5 {
+            if dec.read_next_byte().is_none() {
+                break;
+            }
+        }
+    }
     // Missing rows are white-filled in the stream's own convention (1-bits
     // are white unless /BlackIs1) — only meaningful when /Rows declares the
     // expected size; without /Rows the stream ends at EOF like the reference.
@@ -76,7 +96,7 @@ pub fn decode_with(data: &[u8], p: &FaxParms) -> Result<Vec<u8>> {
         let fill = if p.black_is1 { 0x00 } else { 0xff };
         out.resize(target, fill);
     }
-    Ok(out)
+    Ok((out, dec.pos))
 }
 
 /// Streaming decoder — one output byte per [`Decoder::read_next_byte`] call,

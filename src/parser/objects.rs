@@ -101,10 +101,26 @@ impl PdfStream {
         if is_ccitt {
             names.pop();
         }
+        // JBIG2Decode likewise terminates the pipeline (ISO 32000-1 §7.4.7)
+        // and needs its own decoding path. Without a document, /JBIG2Globals
+        // cannot be resolved — decode with no globals (single-stream files
+        // still work).
+        let is_jbig2 = matches!(names.last(), Some(&"JBIG2Decode"));
+        if is_jbig2 {
+            names.pop();
+        }
         let data = filters::apply_pipeline(&names, &self.raw_data)?;
         if is_ccitt {
             let parms = self.decode_parms().cloned();
             return super::ccitt::decode(&data, parms.as_ref());
+        }
+        if is_jbig2 {
+            if self.decode_parms().is_some() {
+                log::warn!("[decode] JBIG2Decode /JBIG2Globals needs document context; decoding without globals");
+            }
+            let (w, h, buf) = super::jbig2::decode(&data, None)?;
+            let _ = (w, h); // dimensions live in the image dictionary
+            return Ok(buf.into_iter().map(|b| b ^ 0xff).collect());
         }
         if let Some(parms) = self.decode_parms() {
             apply_predictor(data, parms)
@@ -122,6 +138,10 @@ impl PdfStream {
         let mut names: Vec<&str> = filter_names.iter().map(|s| s.as_str()).collect();
         let is_ccitt = matches!(names.last(), Some(&"CCITTFaxDecode") | Some(&"CCF"));
         if is_ccitt {
+            names.pop();
+        }
+        let is_jbig2 = matches!(names.last(), Some(&"JBIG2Decode"));
+        if is_jbig2 {
             names.pop();
         }
         let data = filters::apply_pipeline(&names, &self.raw_data)?;
@@ -161,6 +181,25 @@ impl PdfStream {
 
         if is_ccitt {
             return super::ccitt::decode(&data, parms.as_ref());
+        }
+
+        if is_jbig2 {
+            // /JBIG2Globals (ISO 32000-1 §7.4.7.2) holds the shared symbol
+            // dictionary + custom Huffman table segments.
+            let globals: Option<Vec<u8>> = match parms.as_ref().and_then(|p| p.get("JBIG2Globals"))
+            {
+                Some(PdfObject::Reference(id, ..)) => doc.get_stream_data(*id).ok(),
+                Some(_) => {
+                    log::warn!("[decode] /JBIG2Globals is not an indirect reference — ignoring");
+                    None
+                }
+                None => None,
+            };
+            let (w, h, buf) = super::jbig2::decode(&data, globals.as_deref())?;
+            let _ = (w, h); // dimensions live in the image dictionary
+                            // JBIG2 packs 1 = black; PDF image samples want 1 = white
+                            // (pdf.js Jbig2Stream inverts the whole buffer).
+            return Ok(buf.into_iter().map(|b| b ^ 0xff).collect());
         }
 
         if let Some(ref p) = parms {

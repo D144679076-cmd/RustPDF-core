@@ -10,6 +10,7 @@ pub mod ccitt;
 pub mod ccitt_parms;
 pub mod ccitt_tables;
 pub mod filters;
+pub mod jbig2;
 pub mod lexer;
 pub mod objects;
 pub mod version;

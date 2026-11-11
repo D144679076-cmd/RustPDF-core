@@ -27,3 +27,4 @@ tests/fixtures/ref/
 
 # node harness produced by tests/gen_ccitt_fixtures.py
 tests/.ccittref/
+tests/.jbig2ref/
