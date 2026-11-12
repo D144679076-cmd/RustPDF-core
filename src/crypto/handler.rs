@@ -608,7 +608,7 @@ pub fn compute_legacy_entries(
     if !(2..=4).contains(&revision) {
         return Err(PdfError::filter_error(
             0,
-            &format!("unsupported encryption revision for write: R{revision} (2-4 only)"),
+            format!("unsupported encryption revision for write: R{revision} (2-4 only)"),
         ));
     }
     let o_entry = compute_o_entry(user_password, owner_password, revision, key_bytes);

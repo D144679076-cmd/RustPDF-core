@@ -1470,13 +1470,18 @@ fn sigs_to_json(results: &[crate::signatures::SignatureVerification]) -> String 
                 Some(e) => format!(",\"error\":{}", super::json_str(e)),
                 None => String::new(),
             };
+            let timestamp = match &r.timestamp {
+                Some(t) => format!(",\"timestamp\":{}", super::json_str(t)),
+                None => String::new(),
+            };
             format!(
-                "{{\"field_name\":{},\"valid\":{},\"covers_whole_file\":{}{}{}}}",
+                "{{\"field_name\":{},\"valid\":{},\"covers_whole_file\":{}{}{}{}}}",
                 super::json_str(&r.field_name),
                 r.signature_valid,
                 r.covers_whole_file,
                 signer,
                 error,
+                timestamp,
             )
         })
         .collect();

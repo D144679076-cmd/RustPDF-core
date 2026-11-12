@@ -18,6 +18,11 @@ pub struct SignatureVerification {
     pub covers_whole_file: bool,
     /// Subject common-name extracted from the signer certificate, if parseable.
     pub signer_name: Option<String>,
+    /// RFC 3161 timestamp `genTime` (string as encoded, e.g. GeneralizedTime),
+    /// when the CMS carries an `id-aa-timeStampToken` unsigned attribute.
+    /// Untrusted metadata — the TSA token's own signature is not validated
+    /// until the chain-validation phase (plan §7).
+    pub timestamp: Option<String>,
     /// Human-readable error, present when `signature_valid` is false.
     pub error: Option<String>,
 }
@@ -136,6 +141,7 @@ fn verify_field(
             signature_valid: false,
             covers_whole_file,
             signer_name: None,
+            timestamp: None,
             error: Some("/ByteRange extends beyond file".to_owned()),
         }));
     }
@@ -153,19 +159,19 @@ fn verify_field(
         .unwrap_or(0);
     let cms_der = &contents_bytes[..cms_end];
 
-    // Hash the two signed byte ranges.
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&doc_bytes[r1s as usize..(r1s + r1l) as usize]);
-    hasher.update(&doc_bytes[r2s as usize..(r2s + r2l) as usize]);
-    let computed_hash: [u8; 32] = hasher.finalize().into();
-
-    match verify_cms_signed_data(cms_der, &computed_hash) {
-        Ok(signer_name) => Ok(Some(SignatureVerification {
+    // Hash the two signed byte ranges (digest chosen from the signer's
+    // `digestAlgorithm` inside `verify_cms_signed_data`).
+    match verify_cms_signed_data(
+        cms_der,
+        &doc_bytes[r1s as usize..(r1s + r1l) as usize],
+        &doc_bytes[r2s as usize..(r2s + r2l) as usize],
+    ) {
+        Ok((signer_name, timestamp)) => Ok(Some(SignatureVerification {
             field_name,
             signature_valid: true,
             covers_whole_file,
             signer_name,
+            timestamp,
             error: None,
         })),
         Err(e) => Ok(Some(SignatureVerification {
@@ -173,6 +179,7 @@ fn verify_field(
             signature_valid: false,
             covers_whole_file,
             signer_name: None,
+            timestamp: None,
             error: Some(e.to_string()),
         })),
     }
@@ -184,6 +191,7 @@ fn err_result(field_name: String, msg: &str) -> SignatureVerification {
         signature_valid: false,
         covers_whole_file: false,
         signer_name: None,
+        timestamp: None,
         error: Some(msg.to_owned()),
     }
 }
@@ -198,90 +206,88 @@ fn extract_u64(obj: &PdfObject) -> u64 {
 
 // ── CMS verification ──────────────────────────────────────────────────────────
 
-/// Verify the CMS `SignedData` `cms_der` against `content_hash`.
+/// Verify the CMS `SignedData` `cms_der` over the two signed byte ranges
+/// `range1`/`range2`.
 ///
-/// Returns the signer's common name on success.
-fn verify_cms_signed_data(cms_der: &[u8], content_hash: &[u8; 32]) -> Result<Option<String>> {
-    use super::cms::{der_parse, der_set, OID_RSA_ENCRYPTION, OID_SIGNED_DATA};
+/// Uses the structured CMS parser (`cms_parse`) instead of hand-walking DER.
+/// The digest is selected from the signer's `digestAlgorithm` (SHA-256/384/512;
+/// SHA-1 is rejected as deprecated). Returns the signer's common name and, when
+/// present, the RFC 3161 timestamp `genTime` (untrusted until chain validation).
+fn verify_cms_signed_data(
+    cms_der: &[u8],
+    range1: &[u8],
+    range2: &[u8],
+) -> Result<(Option<String>, Option<String>)> {
+    use super::cms::{
+        der_set, OID_RSA_ENCRYPTION, OID_SHA1WITH_RSA, OID_SHA256WITH_RSA, OID_SHA384WITH_RSA,
+        OID_SHA512WITH_RSA,
+    };
+    use super::cms_parse::{parse_cms_signed_data, timestamp_gen_time};
 
-    // ContentInfo ::= SEQUENCE { OID id-signedData, [0] EXPLICIT SignedData }
-    let (_, ci_content, _) =
-        der_parse(cms_der).map_err(|e| PdfError::write_error(format!("CMS ContentInfo: {e}")))?;
-    let (oid_tag, oid_val, ci_rest) =
-        der_parse(ci_content).map_err(|e| PdfError::write_error(format!("CMS OID: {e}")))?;
-    if oid_tag != 0x06 || oid_val != OID_SIGNED_DATA {
-        return Err(PdfError::write_error("not a SignedData ContentInfo"));
-    }
-    // [0] EXPLICIT { SignedData SEQUENCE }
-    let (_, ctx0_val, _) =
-        der_parse(ci_rest).map_err(|e| PdfError::write_error(format!("CMS ctx0: {e}")))?;
-    // ctx0_val is the SignedData SEQUENCE bytes.
-    let (_, sd_body, _) = der_parse(ctx0_val)
-        .map_err(|e| PdfError::write_error(format!("CMS SignedData seq: {e}")))?;
+    let parsed = parse_cms_signed_data(cms_der)?;
 
-    // Walk SignedData body: version, digestAlgorithms, encapContentInfo, [0]?, signerInfos.
-    let (_, _, sd_rest) = der_parse(sd_body) // version
-        .map_err(|e| PdfError::write_error(format!("SD version: {e}")))?;
-    let (_, _, sd_rest) =
-        der_parse(sd_rest) // digestAlgorithms
-            .map_err(|e| PdfError::write_error(format!("SD digestAlgorithms: {e}")))?;
-    let (_, _, sd_rest) =
-        der_parse(sd_rest) // encapContentInfo
-            .map_err(|e| PdfError::write_error(format!("SD encapContentInfo: {e}")))?;
-    let sd_rest = skip_context_tags(sd_rest); // skip optional [0] certs and [1] crls
+    // Digest from the signer's digestAlgorithm.
+    use sha2::{Digest, Sha256, Sha384, Sha512};
+    let embedded_hash: Vec<u8> = match parsed.signer.digest_algorithm {
+        super::cms::OID_SHA256 => Sha256::digest([range1, range2].concat()).to_vec(),
+        super::cms::OID_SHA384 => Sha384::digest([range1, range2].concat()).to_vec(),
+        super::cms::OID_SHA512 => Sha512::digest([range1, range2].concat()).to_vec(),
+        super::cms::OID_SHA1 => {
+            return Err(PdfError::write_error(
+                "signature uses deprecated SHA-1 digest — rejected",
+            ))
+        }
+        _ => {
+            return Err(PdfError::write_error(
+                "unsupported digest algorithm in signerInfo",
+            ))
+        }
+    };
 
-    // signerInfos SET
-    let (_, si_set_val, _) =
-        der_parse(sd_rest).map_err(|e| PdfError::write_error(format!("SD signerInfos: {e}")))?;
-    let (_, si_body, _) = der_parse(si_set_val)
-        .map_err(|e| PdfError::write_error(format!("signerInfo SEQUENCE: {e}")))?;
-
-    // SignerInfo: version, sid, digestAlgorithm, [0] signedAttrs, signatureAlgorithm, signature.
-    let (_, _, si_rest) = der_parse(si_body) // version
-        .map_err(|e| PdfError::write_error(format!("SI version: {e}")))?;
-    let (_, _, si_rest) = der_parse(si_rest) // sid
-        .map_err(|e| PdfError::write_error(format!("SI sid: {e}")))?;
-    let (_, _, si_rest) =
-        der_parse(si_rest) // digestAlgorithm
-            .map_err(|e| PdfError::write_error(format!("SI digestAlgorithm: {e}")))?;
-
-    // [0] IMPLICIT signedAttrs — tag 0xa0.
-    let (ctx_tag, signed_attrs_val, si_rest) =
-        der_parse(si_rest).map_err(|e| PdfError::write_error(format!("SI signedAttrs: {e}")))?;
-    if ctx_tag != 0xa0 {
-        return Err(PdfError::write_error(
-            "expected [0] signedAttrs tag in SignerInfo",
-        ));
-    }
-
+    let signed_attrs_val = parsed
+        .signer
+        .signed_attrs
+        .ok_or_else(|| PdfError::write_error("expected [0] signedAttrs tag in SignerInfo"))?;
     // RFC 5652 §5.4: replace [0] IMPLICIT with SET tag for hashing.
     let signed_attrs_set = der_set(signed_attrs_val);
 
     // Verify the embedded messageDigest matches our computed hash.
-    let embedded_hash = find_message_digest(signed_attrs_val)?;
-    if &embedded_hash != content_hash {
+    let md = parsed
+        .signer
+        .message_digest
+        .ok_or_else(|| PdfError::write_error("messageDigest attribute not found"))?;
+    if md != embedded_hash {
         return Err(PdfError::write_error(
             "messageDigest does not match signed byte ranges hash",
         ));
     }
 
-    // signatureAlgorithm SEQUENCE
-    let (_, sig_alg_val, si_rest) = der_parse(si_rest)
-        .map_err(|e| PdfError::write_error(format!("SI signatureAlgorithm: {e}")))?;
-    let (_, rsa_oid_val, _) =
-        der_parse(sig_alg_val).map_err(|e| PdfError::write_error(format!("SI sigAlg OID: {e}")))?;
-    if rsa_oid_val != OID_RSA_ENCRYPTION {
+    // Signature-algorithm OID: our builder emits rsaEncryption; real-world
+    // signers typically emit sha*WithRSAEncryption. Reject sha1WithRSA.
+    let sig_alg = parsed.signer.signature_algorithm;
+    if sig_alg == OID_SHA1WITH_RSA {
         return Err(PdfError::write_error(
-            "unsupported signature algorithm (expected RSA)",
+            "signature uses deprecated sha1WithRSAEncryption — rejected",
+        ));
+    }
+    if sig_alg != OID_RSA_ENCRYPTION
+        && sig_alg != OID_SHA256WITH_RSA
+        && sig_alg != OID_SHA384WITH_RSA
+        && sig_alg != OID_SHA512WITH_RSA
+    {
+        return Err(PdfError::write_error(
+            "unsupported signature algorithm (expected RSA PKCS#1v15)",
         ));
     }
 
-    // signature OCTET STRING
-    let (_, sig_bytes, _) =
-        der_parse(si_rest).map_err(|e| PdfError::write_error(format!("SI signature: {e}")))?;
-
-    // Locate the signer certificate stored in SignedData [0].
-    let cert_der = find_certificate(ctx0_val)?;
+    // Signer certificate: first entry of the parsed certificate pool (the
+    // builder emits the signer's own cert first). Limitation logged: sid
+    // (issuer/serial) matching against the pool is chain-validation work.
+    let cert_der = parsed
+        .certificates
+        .first()
+        .copied()
+        .ok_or_else(|| PdfError::write_error("no certificate in SignedData [0] block"))?;
     let signer_name = extract_common_name(cert_der);
 
     // Extract the RSA public key from the certificate and verify.
@@ -300,85 +306,38 @@ fn verify_cms_signed_data(cms_der: &[u8], content_hash: &[u8; 32]) -> Result<Opt
 
     use rsa::pkcs1v15::VerifyingKey;
     use rsa::signature::Verifier;
-    let verifying_key = VerifyingKey::<sha2::Sha256>::new(pub_key);
-    let sig = rsa::pkcs1v15::Signature::try_from(sig_bytes)
+    let sig = rsa::pkcs1v15::Signature::try_from(parsed.signer.signature)
         .map_err(|e| PdfError::write_error(format!("RSA signature parse: {e}")))?;
-    verifying_key
-        .verify(&signed_attrs_set, &sig)
-        .map_err(|e| PdfError::write_error(format!("RSA verify failed: {e}")))?;
+    let sig_alg = sig_alg.to_vec();
+    let digest_alg = parsed.signer.digest_algorithm.to_vec();
+    match (sig_alg.as_slice(), digest_alg.as_slice()) {
+        (OID_SHA384WITH_RSA, _) | (_, super::cms::OID_SHA384) => {
+            VerifyingKey::<sha2::Sha384>::new(pub_key)
+                .verify(&signed_attrs_set, &sig)
+                .map_err(|e| PdfError::write_error(format!("RSA verify failed: {e}")))
+        }
+        (OID_SHA512WITH_RSA, _) | (_, super::cms::OID_SHA512) => {
+            VerifyingKey::<sha2::Sha512>::new(pub_key)
+                .verify(&signed_attrs_set, &sig)
+                .map_err(|e| PdfError::write_error(format!("RSA verify failed: {e}")))
+        }
+        // rsaEncryption or sha256WithRSA → SHA-256 (the default digest here).
+        _ => VerifyingKey::<sha2::Sha256>::new(pub_key)
+            .verify(&signed_attrs_set, &sig)
+            .map_err(|e| PdfError::write_error(format!("RSA verify failed: {e}"))),
+    }?;
 
-    Ok(signer_name)
-}
+    // RFC 3161 timestamp token: surface genTime when present (untrusted until
+    // the TSA token itself is validated in the chain-validation phase).
+    let timestamp = match parsed.signer.timestamp_token {
+        Some(token) => timestamp_gen_time(token).unwrap_or_else(|e| {
+            log::debug!("timestamp token present but unparsable: {e}");
+            None
+        }),
+        None => None,
+    };
 
-/// Scan `attrs` (body of a signedAttrs SET) for the `messageDigest` attribute.
-fn find_message_digest(attrs: &[u8]) -> Result<[u8; 32]> {
-    use super::cms::{der_parse, OID_MESSAGE_DIGEST};
-    let mut cur = attrs;
-    while !cur.is_empty() {
-        let (tag, attr_val, rest) =
-            der_parse(cur).map_err(|e| PdfError::write_error(format!("attrs parse: {e}")))?;
-        cur = rest;
-        if tag != 0x30 {
-            continue;
-        }
-        let (_, oid_bytes, attr_rest) =
-            der_parse(attr_val).map_err(|e| PdfError::write_error(format!("attr OID: {e}")))?;
-        if oid_bytes == OID_MESSAGE_DIGEST {
-            // SET { OCTET STRING(hash) }
-            let (_, set_val, _) =
-                der_parse(attr_rest).map_err(|e| PdfError::write_error(format!("md SET: {e}")))?;
-            let (_, hash_val, _) =
-                der_parse(set_val).map_err(|e| PdfError::write_error(format!("md OCTET: {e}")))?;
-            if hash_val.len() != 32 {
-                return Err(PdfError::write_error(
-                    "messageDigest is not 32 bytes (SHA-256)",
-                ));
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(hash_val);
-            return Ok(out);
-        }
-    }
-    Err(PdfError::write_error("messageDigest attribute not found"))
-}
-
-/// Find the first certificate DER stored in the SignedData `[0] IMPLICIT` block.
-///
-/// `signed_data_seq` is the complete SignedData SEQUENCE bytes (tag + length + body).
-/// In our builder, `[0]` stores the raw cert DER directly (not inside a SET).
-fn find_certificate(signed_data_seq: &[u8]) -> Result<&[u8]> {
-    use super::cms::der_parse;
-    let (_, sd_body, _) =
-        der_parse(signed_data_seq).map_err(|e| PdfError::write_error(format!("SD seq: {e}")))?;
-    let mut cur = sd_body;
-    while !cur.is_empty() {
-        let (tag, val, rest) =
-            der_parse(cur).map_err(|e| PdfError::write_error(format!("SD field: {e}")))?;
-        cur = rest;
-        if tag == 0xa0 {
-            // val is the cert DER directly (our builder does `der_ctx0(cert_der)`).
-            return Ok(val);
-        }
-    }
-    Err(PdfError::write_error(
-        "no [0] certificates block in SignedData",
-    ))
-}
-
-/// Skip over optional context-tagged fields (tags 0xa0 and 0xa1) in a stream.
-fn skip_context_tags(data: &[u8]) -> &[u8] {
-    use super::cms::der_parse;
-    let mut cur = data;
-    while let Some(&tag) = cur.first() {
-        if tag != 0xa0 && tag != 0xa1 {
-            break;
-        }
-        match der_parse(cur) {
-            Ok((_, _, rest)) => cur = rest,
-            Err(_) => break,
-        }
-    }
-    cur
+    Ok((signer_name, timestamp))
 }
 
 /// Best-effort extraction of the Subject CN from a certificate DER.

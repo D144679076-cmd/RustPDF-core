@@ -22,6 +22,7 @@
 //! read-only, lazily resolved.
 
 pub(crate) mod cms;
+pub(crate) mod cms_parse;
 pub mod dss;
 pub mod signer;
 pub mod verifier;

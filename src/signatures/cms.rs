@@ -23,6 +23,33 @@ pub(crate) const OID_MESSAGE_DIGEST: &[u8] =
     &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 /// id-signingTime attribute OID: 1.2.840.113549.1.9.5
 pub(crate) const OID_SIGNING_TIME: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x05];
+/// SHA-384 digest algorithm OID: 2.16.840.1.101.3.4.2.2
+pub(crate) const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+/// SHA-512 digest algorithm OID: 2.16.840.1.101.3.4.2.3
+pub(crate) const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+/// SHA-1 digest algorithm OID (deprecated — rejected in verification):
+/// 1.3.14.3.2.26
+pub(crate) const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+/// id-aa-timeStampToken unsignedAttr OID: 1.2.840.113549.1.9.16.2.14 (RFC 3161)
+pub(crate) const OID_AA_TIMESTAMP_TOKEN: &[u8] = &[
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x0e,
+];
+/// id-ct-TSTInfo content-type OID: 1.2.840.113549.1.9.16.1.4 (RFC 3161)
+pub(crate) const OID_CT_TST_INFO: &[u8] = &[
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x04,
+];
+/// sha256WithRSAEncryption signature-algorithm OID: 1.2.840.113549.1.1.11
+pub(crate) const OID_SHA256WITH_RSA: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+/// sha384WithRSAEncryption: 1.2.840.113549.1.1.12
+pub(crate) const OID_SHA384WITH_RSA: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+/// sha512WithRSAEncryption: 1.2.840.113549.1.1.13
+pub(crate) const OID_SHA512WITH_RSA: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+/// sha1WithRSAEncryption (deprecated — rejected for chain validation):
+/// 1.2.840.113549.1.1.5
+pub(crate) const OID_SHA1WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
 
 // ── DER primitive encoding ────────────────────────────────────────────────────
 
@@ -197,6 +224,9 @@ pub(crate) fn der_parse_len(data: &[u8]) -> Result<(usize, usize)> {
 
 /// Build a detached PKCS#7 CMS `SignedData` DER for embedding in a PDF.
 ///
+/// Single-cert, no-unsigned-attrs convenience wrapper over
+/// [`build_cms_signed_data_with_chain`].
+///
 /// - `content_hash` — SHA-256 of the signed byte ranges (excluding `/Contents`).
 /// - `private_key_der` — PKCS#8 RSA private key in DER.
 /// - `cert_der` — Signer X.509 certificate in DER.
@@ -208,6 +238,36 @@ pub fn build_cms_signed_data(
     private_key_der: &[u8],
     cert_der: &[u8],
     signing_time: Option<u64>,
+) -> Result<Vec<u8>> {
+    build_cms_signed_data_with_chain(
+        content_hash,
+        private_key_der,
+        cert_der,
+        signing_time,
+        &[],
+        None,
+    )
+}
+
+/// Build a detached CMS `SignedData` with the full certificate chain and an
+/// optional RFC 3161 timestamp token embedded as an unsigned attribute.
+///
+/// - `chain_certs` — Additional CA/intermediate certificates (DER) beyond the
+///   signer's own; enables the verifier to build a trust path offline.
+/// - `timestamp_token` — Optional RFC 3161 `TimeStampToken` (a complete DER
+///   `ContentInfo`), embedded as the `id-aa-timeStampToken` unsigned attribute
+///   (RFC 3161 §2.4.1). RSA PKCS#1v15 signing is deterministic, so callers can
+///   sign once, request a token over `hash(signatureValue)`, and re-sign with
+///   the token — `signatureValue` stays byte-identical.
+///
+/// All other parameters as in [`build_cms_signed_data`].
+pub fn build_cms_signed_data_with_chain(
+    content_hash: &[u8; 32],
+    private_key_der: &[u8],
+    cert_der: &[u8],
+    signing_time: Option<u64>,
+    chain_certs: &[Vec<u8>],
+    timestamp_token: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     // 1. Parse the PKCS#8 RSA private key.
     use rsa::pkcs8::DecodePrivateKey;
@@ -292,16 +352,36 @@ pub fn build_cms_signed_data(
         c.extend(der_ctx0(&attrs)); // [0] IMPLICIT signedAttrs
         c.extend(rsa_alg_id.clone());
         c.extend(der_octet(&sig_bytes));
+        if let Some(token) = timestamp_token {
+            // [1] IMPLICIT unsignedAttrs — SET OF Attribute.
+            let ts_attr = {
+                let mut a = der_oid(OID_AA_TIMESTAMP_TOKEN);
+                a.extend(der_set(token)); // SET OF TimeStampToken (ContentInfo)
+                der_seq(&a)
+            };
+            c.extend(der_tlv(0xa1, &ts_attr));
+        }
         der_seq(&c)
     };
 
     // 8. Build SignedData.
     let encap_ci = der_seq(&der_oid(OID_ID_DATA)); // no eContent — detached
+    let certs_block = if chain_certs.is_empty() {
+        // Legacy shape: single cert DER directly inside [0] IMPLICIT.
+        der_ctx0(cert_der)
+    } else {
+        // RFC 5652 §9.1: [0] IMPLICIT CertificateSet — SET OF Certificate.
+        let mut set_c = cert_der.to_vec();
+        for extra in chain_certs {
+            set_c.extend_from_slice(extra);
+        }
+        der_ctx0(&der_set(&set_c))
+    };
     let signed_data = {
         let mut c = der_int_u32(1); // version 1
         c.extend(der_set(&sha256_alg_id)); // digestAlgorithms
         c.extend(encap_ci); // encapContentInfo
-        c.extend(der_ctx0(cert_der)); // [0] IMPLICIT certificates
+        c.extend(certs_block); // [0] IMPLICIT certificates
         c.extend(der_set(&signer_info)); // signerInfos
         der_seq(&c)
     };
