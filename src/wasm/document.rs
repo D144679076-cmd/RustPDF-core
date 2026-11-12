@@ -377,6 +377,54 @@ impl WasmDocument {
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(extractor.plain_text())
     }
+
+    /// Extracts plain text in column-aware reading order (plan Phase 3).
+    ///
+    /// `min_gap` is the minimum gutter width in user-space units that counts
+    /// as a column separator; a good default is twice the body font size
+    /// (e.g. `24.0` for 12 pt text). Single-column pages return the normal
+    /// top-to-bottom order.
+    pub fn extract_text_columns(&self, page_index: usize, min_gap: f64) -> Result<String, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.doc, |p| p.can_copy_text, "copy_text")?;
+        use crate::document::catalog::Catalog;
+        use crate::document::page::Page;
+        use crate::text::TextExtractor;
+
+        let catalog =
+            Catalog::from_document(&self.doc).map_err(|e| JsError::new(&e.to_string()))?;
+        let page_dict = catalog
+            .get_page_dict(&self.doc, page_index)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let page =
+            Page::from_dict(&self.doc, &page_dict).map_err(|e| JsError::new(&e.to_string()))?;
+        let extractor = TextExtractor::extract_from_page(&self.doc, &page)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(extractor.plain_text_columns(min_gap.max(0.0)))
+    }
+
+    /// Extracts plain text with end-of-line hyphenation repaired (plan
+    /// Phase 3): words broken across lines by `-` / U+2010 are joined when
+    /// the continuation starts with a lowercase letter; soft hyphens are
+    /// always removed.
+    pub fn extract_text_dehyphenated(&self, page_index: usize) -> Result<String, JsError> {
+        #[cfg(feature = "crypto")]
+        super::check_permission(&self.doc, |p| p.can_copy_text, "copy_text")?;
+        use crate::document::catalog::Catalog;
+        use crate::document::page::Page;
+        use crate::text::TextExtractor;
+
+        let catalog =
+            Catalog::from_document(&self.doc).map_err(|e| JsError::new(&e.to_string()))?;
+        let page_dict = catalog
+            .get_page_dict(&self.doc, page_index)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let page =
+            Page::from_dict(&self.doc, &page_dict).map_err(|e| JsError::new(&e.to_string()))?;
+        let extractor = TextExtractor::extract_from_page(&self.doc, &page)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(extractor.plain_text_dehyphenated())
+    }
 }
 
 // ---------------------------------------------------------------------------
