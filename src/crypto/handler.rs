@@ -500,6 +500,136 @@ fn dict_bool(dict: &PdfDict, key: &str, default: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Writer-side entry computation (Phase P4: encrypt on write)
+// ---------------------------------------------------------------------------
+// The functions above derive keys *from* existing /O and /U entries (reader
+// direction). The functions below *compute* those entries for a fresh
+// /Encrypt dictionary (writer direction), mirroring qpdf's
+// `QPDF::compute_encryption_O_U`. Round-trip correctness is guaranteed by
+// construction: the same primitives the reader verifies with are reused.
+
+/// Computed legacy encryption-dictionary entries (V ≤ 4, R 2–4) plus the
+/// derived file encryption key.
+#[derive(Debug, Clone)]
+pub struct ComputedLegacyEntries {
+    /// Computed `/O` value (owner-password entry, 32 bytes).
+    pub o_entry: Vec<u8>,
+    /// Computed `/U` value (user-password entry, 32 bytes).
+    pub u_entry: Vec<u8>,
+    /// Derived file encryption key (`key_bytes` long).
+    pub file_key: Vec<u8>,
+}
+
+/// Compute the `/O` entry — Algorithm 3 (ISO 32000-1 §7.6.3.3).
+///
+/// `owner_password` defaults to the user password when absent (the common
+/// case where a document only sets a user password).
+///
+/// Returns exactly 32 bytes.
+fn compute_o_entry(
+    user_password: &[u8],
+    owner_password: Option<&[u8]>,
+    revision: u8,
+    key_bytes: usize,
+) -> Vec<u8> {
+    // Step 1-3: hash the padded owner password (Algorithm 3 steps 1-4).
+    let owner = owner_password.unwrap_or(user_password);
+    let mut hash: [u8; 16] = Md5::digest(pad_password(owner)).into();
+    if revision >= 3 {
+        for _ in 0..50 {
+            hash = Md5::digest(&hash[..key_bytes]).into();
+        }
+    }
+    let rc4_key = &hash[..key_bytes];
+
+    // Step 4-6: RC4 the padded user password with the derived key.
+    // R ≥ 3 runs 20 rounds with the round key XOR'd by 0..19 (same convention
+    // as the reader-side `verify_user_password_r3`).
+    let mut data = pad_password(user_password);
+    let rounds = if revision >= 3 { 20 } else { 1 };
+    for i in 0..rounds {
+        let round_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
+        if let Some(mut rc4) = Rc4::new(&round_key) {
+            rc4.apply_keystream(&mut data);
+        }
+    }
+    data.to_vec()
+}
+
+/// Compute the `/U` entry — Algorithm 4 (R=2) / Algorithm 5 (R≥3).
+///
+/// `file_key` must already be derived with [`derive_file_key`] using the
+/// *computed* `/O` entry. Returns exactly 32 bytes.
+fn compute_u_entry(file_key: &[u8], revision: u8, file_id: &[u8], key_bytes: usize) -> Vec<u8> {
+    if revision < 3 {
+        // Algorithm 4: U = RC4(file_key, padding).
+        let mut data = PASSWORD_PADDING;
+        if let Some(mut rc4) = Rc4::new(&file_key[..key_bytes]) {
+            rc4.apply_keystream(&mut data);
+        }
+        return data.to_vec();
+    }
+    // Algorithm 5: MD5(padding || id) then 20-round RC4 with file_key ^ i.
+    let mut hasher = Md5::new();
+    hasher.update(PASSWORD_PADDING);
+    hasher.update(file_id);
+    let mut data: [u8; 16] = hasher.finalize().into();
+    for k in 0u8..20 {
+        let round_key: Vec<u8> = file_key.iter().map(|&b| b ^ k).collect();
+        if let Some(mut rc4) = Rc4::new(&round_key) {
+            rc4.apply_keystream(&mut data);
+        }
+    }
+    let mut out = data.to_vec();
+    // Pad to 32 bytes with arbitrary data (readers compare only the first 16).
+    out.extend_from_slice(&[0u8; 16]);
+    out
+}
+
+/// Compute all legacy (V ≤ 4) encryption entries from scratch — writer
+/// direction for RC4-128 (V=2/R=3) and AES-128 (V=4/R=4).
+///
+/// Steps (ISO 32000-1 §7.6.3.3):
+/// 1. Algorithm 3 — compute `/O` from the owner password.
+/// 2. Algorithm 2 — derive the file key from the user password + computed `/O`.
+/// 3. Algorithm 4/5 — compute `/U` from the file key.
+///
+/// `revision` must be 2 (RC4-40), 3 (RC4-128) or 4 (AES-128 / RC4 crypt
+/// filters). `encrypt_metadata` is always assumed `true` (our writer never
+/// emits `/EncryptMetadata false`).
+pub fn compute_legacy_entries(
+    user_password: &[u8],
+    owner_password: Option<&[u8]>,
+    revision: u8,
+    key_bytes: usize,
+    p_flags: i32,
+    file_id: &[u8],
+) -> Result<ComputedLegacyEntries> {
+    if !(2..=4).contains(&revision) {
+        return Err(PdfError::filter_error(
+            0,
+            &format!("unsupported encryption revision for write: R{revision} (2-4 only)"),
+        ));
+    }
+    let o_entry = compute_o_entry(user_password, owner_password, revision, key_bytes);
+    let file_key = derive_file_key(
+        user_password,
+        revision,
+        key_bytes,
+        &o_entry,
+        p_flags,
+        file_id,
+        true,
+    );
+    let u_entry = compute_u_entry(&file_key, revision, file_id, key_bytes);
+    Ok(ComputedLegacyEntries {
+        o_entry,
+        u_entry,
+        file_key,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -528,6 +658,71 @@ mod tests {
         let trailer: PdfDict = PdfDict::new();
         let result = EncryptionHandler::from_trailer(&trailer, b"", b"", PdfVersion::V1_7);
         assert!(matches!(result, Ok(None)));
+    }
+
+    // --- writer-side entry computation (Phase P4) ----------------------------
+
+    #[test]
+    fn compute_legacy_r3_roundtrips_through_reader_verify() {
+        let user_pw = b"user-secret";
+        let owner_pw = Some("owner-secret".as_bytes());
+        let file_id = b"0123456789abcdef";
+        let entries =
+            compute_legacy_entries(user_pw, owner_pw, 3, 16, -4, file_id).expect("compute R3");
+
+        // Reader-side verification must accept the computed entries.
+        let file_key_check = derive_file_key(user_pw, 3, 16, &entries.o_entry, -4, file_id, true);
+        assert_eq!(file_key_check, entries.file_key);
+        assert!(verify_user_password_r3(
+            &entries.file_key,
+            3,
+            &entries.u_entry,
+            file_id
+        ));
+        // Wrong password must not verify.
+        let wrong = compute_legacy_entries(b"wrong", owner_pw, 3, 16, -4, file_id)
+            .expect("compute R3 (wrong pw is a valid dict)");
+        assert!(!verify_user_password_r3(
+            &wrong.file_key,
+            3,
+            &entries.u_entry,
+            file_id
+        ));
+        // O entry is exactly 32 bytes; U entry exactly 32 bytes.
+        assert_eq!(entries.o_entry.len(), 32);
+        assert_eq!(entries.u_entry.len(), 32);
+    }
+
+    #[test]
+    fn compute_legacy_r2_roundtrips_through_reader_verify() {
+        let user_pw = b"u2";
+        let file_id = b"id123";
+        let entries = compute_legacy_entries(user_pw, None, 2, 5, -1, file_id).expect("compute R2");
+        assert!(verify_user_password_r2(&entries.file_key, &entries.u_entry));
+        assert_eq!(entries.o_entry.len(), 32);
+        assert_eq!(entries.u_entry.len(), 32);
+    }
+
+    #[test]
+    fn compute_legacy_r4_uses_r3_entry_format() {
+        // V4/R4 (AES-128) shares the R3 /O and /U computation.
+        let user_pw = b"aes-user";
+        let file_id = b"0123456789abcdef";
+        let entries =
+            compute_legacy_entries(user_pw, None, 4, 16, -4, file_id).expect("compute R4");
+        assert!(verify_user_password_r3(
+            &entries.file_key,
+            4,
+            &entries.u_entry,
+            file_id
+        ));
+        assert_eq!(entries.file_key.len(), 16);
+    }
+
+    #[test]
+    fn compute_legacy_rejects_bad_revision() {
+        let result = compute_legacy_entries(b"pw", None, 6, 16, -4, b"id");
+        assert!(matches!(result, Err(PdfError::FilterError { .. })));
     }
 
     #[test]

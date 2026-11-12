@@ -243,7 +243,6 @@ impl PixmapBuffer {
 
 /// Separable modes operate component-wise; `cb` is the backdrop component
 /// (destination), `cs` the source component.
-
 fn blend_hard_light(cb: f32, cs: f32) -> f32 {
     if cs <= 0.5 {
         // Multiply-like on the dark half

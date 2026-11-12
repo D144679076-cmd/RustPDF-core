@@ -271,6 +271,193 @@ fn aes128_cbc_encrypt_r6(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Writer-side entry computation (Phase P4: encrypt on write)
+// ---------------------------------------------------------------------------
+// Computes fresh /O, /U, /UE, /OE and /Perms for a V=5 (R=5/6) /Encrypt
+// dictionary, mirroring qpdf's `Encryption::compute_encryption_parameters_V5`.
+// The reader-side verification functions above are the round-trip oracle.
+
+/// Computed V5 encryption-dictionary entries plus the file encryption key.
+#[derive(Debug, Clone)]
+pub struct R5Entries {
+    /// Computed `/U` value — 48 bytes: hash(32) || validation salt(8) || key salt(8).
+    pub u_entry: [u8; 48],
+    /// Computed `/O` value — 48 bytes, same layout, owner-password side.
+    pub o_entry: [u8; 48],
+    /// Computed `/UE` value — the 32-byte file key encrypted with the
+    /// user-password intermediate key (AES-256-CBC, zero IV, no padding).
+    pub ue_entry: [u8; 32],
+    /// Computed `/OE` value — the file key encrypted with the
+    /// owner-password intermediate key.
+    pub oe_entry: [u8; 32],
+    /// Computed `/Perms` value — AES-256-encrypted 16-byte permissions block.
+    pub perms_entry: [u8; 16],
+    /// The 32-byte file encryption key (kept in the writer, not in the file).
+    pub file_key: [u8; 32],
+}
+
+/// Cryptographically random bytes for salts and file keys.
+///
+/// Mirrors [`super::random_iv`]'s no-panic fallback (R1): on the unlikely
+/// RNG failure a deterministic fallback fills the buffer — values are
+/// secret, but the file remains readable rather than the write failing.
+fn random_bytes(buf: &mut [u8]) {
+    if getrandom::getrandom(buf).is_err() {
+        let seed = (buf.as_ptr() as usize as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let bytes = seed.to_le_bytes();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = bytes[i % 8].wrapping_add(i as u8);
+        }
+    }
+}
+
+/// AES-256-CBC encrypt with a **zero IV and no padding** (32-byte input →
+/// 32-byte output). This is the mode `/UE` and `/OE` use (qpdf
+/// `process_with_aes(..., useZeroIV, disablePadding)`); the zero IV is
+/// implicit — it is NOT written to the output.
+fn aes256_cbc_encrypt_zero_iv_32(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; 32]> {
+    use aes::Aes256;
+    use cbc::cipher::{block_padding::NoPadding, BlockEncryptMut, KeyIvInit};
+
+    let mut buf = *plaintext;
+    let iv = [0u8; 16];
+    let enc = cbc::Encryptor::<Aes256>::new_from_slices(key, &iv)
+        .map_err(|_| PdfError::filter_error(0, "AES-256: invalid key length"))?;
+    enc.encrypt_padded_mut::<NoPadding>(&mut buf, 32)
+        .map_err(|_| PdfError::filter_error(0, "AES-256 encryption failed"))?;
+    Ok(buf)
+}
+
+/// AES-256 single-block encrypt (ECB-equivalent for one block) — used for
+/// `/Perms` (qpdf: AES-256, zero IV, no padding, exactly 16 bytes in/out).
+fn aes256_encrypt_block(key: &[u8; 32], block: &[u8; 16]) -> Result<[u8; 16]> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes256;
+
+    let cipher = Aes256::new_from_slice(key)
+        .map_err(|_| PdfError::filter_error(0, "AES-256: invalid key length"))?;
+    let mut out = *block;
+    cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
+        &mut out,
+    ));
+    Ok(out)
+}
+
+/// Build the clear 16-byte `/Perms` block (qpdf
+/// `compute_Perms_value_V5_clear`, ISO 32000-2 §7.6.4.3.3 Algorithm 13):
+/// bytes 0-3 = /P little-endian, bytes 4-7 = FF FF FF FF, bytes 8-11 =
+/// "Tadb" (byte 8 = 'F' when `/EncryptMetadata` is false — we always emit
+/// `true`, so 'T'), bytes 12-15 = random (validators ignore them).
+fn perms_clear_block(p_flags: i32) -> [u8; 16] {
+    let mut block = [0u8; 16];
+    block[..4].copy_from_slice(&p_flags.to_le_bytes());
+    block[4..8].copy_from_slice(&[0xFF; 4]);
+    block[8..12].copy_from_slice(b"Tadb");
+    random_bytes(&mut block[12..16]);
+    block
+}
+
+/// Shared V5 compute core. `hash(password, salt, udata)` selects R5 (plain
+/// SHA-256) or R6 (Algorithm 2.B); `password_bytes` maps the raw password to
+/// the bytes the hash sees (R6: SASLprep-normalised candidate; R5: raw).
+fn compute_v5_entries(
+    user_password: &[u8],
+    owner_password: &[u8],
+    p_flags: i32,
+    hash: impl Fn(&[u8], &[u8], &[u8]) -> [u8; 32],
+) -> Result<R5Entries> {
+    // The file key itself is 32 random bytes (ISO 32000-2 Algorithm 10 step 2).
+    let mut file_key = [0u8; 32];
+    random_bytes(&mut file_key);
+
+    // Algorithm 11 (user side): U = hash(pw, uvs, "") || uvs || uks.
+    let mut uvs = [0u8; 8];
+    let mut uks = [0u8; 8];
+    random_bytes(&mut uvs);
+    random_bytes(&mut uks);
+    let mut u_entry = [0u8; 48];
+    u_entry[..32].copy_from_slice(&hash(user_password, &uvs, &[]));
+    u_entry[32..40].copy_from_slice(&uvs);
+    u_entry[40..48].copy_from_slice(&uks);
+
+    // User intermediate key + /UE = AES-256-CBC(zero IV, ik, file_key).
+    let user_ik = hash(user_password, &uks, &[]);
+    let ue_entry = aes256_cbc_encrypt_zero_iv_32(&user_ik, &file_key)?;
+
+    // Algorithm 8 (owner side): O = hash(owner pw, ovs, U[0..48]) || ovs || oks.
+    let mut ovs = [0u8; 8];
+    let mut oks = [0u8; 8];
+    random_bytes(&mut ovs);
+    random_bytes(&mut oks);
+    let mut o_entry = [0u8; 48];
+    o_entry[..32].copy_from_slice(&hash(owner_password, &ovs, &u_entry));
+    o_entry[32..40].copy_from_slice(&ovs);
+    o_entry[40..48].copy_from_slice(&oks);
+
+    // Owner intermediate key + /OE.
+    let owner_ik = hash(owner_password, &oks, &u_entry);
+    let oe_entry = aes256_cbc_encrypt_zero_iv_32(&owner_ik, &file_key)?;
+
+    // Algorithm 13: /Perms = AES-256(file_key, clear block).
+    let perms_entry = aes256_encrypt_block(&file_key, &perms_clear_block(p_flags))?;
+
+    Ok(R5Entries {
+        u_entry,
+        o_entry,
+        ue_entry,
+        oe_entry,
+        perms_entry,
+        file_key,
+    })
+}
+
+/// Compute all V=5/R=5 encryption entries (plain SHA-256 hashing).
+///
+/// Passwords are truncated to 127 bytes per spec; no Unicode normalisation
+/// applies at R5 (it is an R6 concept).
+pub fn compute_entries_r5(
+    user_password: &[u8],
+    owner_password: &[u8],
+    p_flags: i32,
+) -> Result<R5Entries> {
+    compute_v5_entries(
+        truncate_password(user_password).as_slice(),
+        truncate_password(owner_password).as_slice(),
+        p_flags,
+        |password, salt, udata| {
+            let mut hasher = Sha256::new();
+            hasher.update(password);
+            hasher.update(salt);
+            hasher.update(udata);
+            hasher.finalize().into()
+        },
+    )
+}
+
+/// Compute all V=5/R=6 encryption entries (Algorithm 2.B iterative hash).
+///
+/// Both passwords go through the R6 candidate pipeline (SASLprep
+/// normalisation, ISO 32000-2 §7.6.4.3.2) so the written dictionary
+/// verifies against the same normalised bytes the reader will try first.
+pub fn compute_entries_r6(
+    user_password: &[u8],
+    owner_password: &[u8],
+    p_flags: i32,
+) -> Result<R5Entries> {
+    let user_candidates = super::password::password_candidates_for_r6(user_password);
+    let owner_candidates = super::password::password_candidates_for_r6(owner_password);
+    let user = user_candidates
+        .first()
+        .map(|c| truncate_password(c))
+        .ok_or_else(|| PdfError::filter_error(0, "R6: empty user password candidates"))?;
+    let owner = owner_candidates
+        .first()
+        .map(|c| truncate_password(c))
+        .ok_or_else(|| PdfError::filter_error(0, "R6: empty owner password candidates"))?;
+    compute_v5_entries(user.as_slice(), owner.as_slice(), p_flags, compute_hash_r6)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -374,5 +561,58 @@ mod tests {
         let ue_entry = [0u8; 32];
         let result = derive_file_key_r5(b"wrong", &u_entry, &ue_entry);
         assert!(result.is_err());
+    }
+
+    // --- writer-side entry computation (Phase P4) ----------------------------
+
+    #[test]
+    fn compute_r5_roundtrips_through_reader_verify() {
+        let entries = compute_entries_r5(b"user-secret", b"owner-secret", -4).expect("compute R5");
+
+        // Reader side: verify user password and recover the same file key.
+        assert!(verify_user_password_r5(b"user-secret", &entries.u_entry));
+        let key = derive_file_key_r5(b"user-secret", &entries.u_entry, &entries.ue_entry)
+            .expect("derive from computed entries");
+        assert_eq!(key, entries.file_key.to_vec());
+
+        // Owner path: hash_V5(owner, O[32..40] (validation salt), U[0..48])
+        // must equal O[0..32], and /OE must decrypt (with the key salt,
+        // O[40..48]) to the same file key.
+        let mut hasher = Sha256::new();
+        hasher.update(truncate_password(b"owner-secret"));
+        hasher.update(&entries.o_entry[32..40]);
+        hasher.update(&entries.u_entry[..48]);
+        let owner_hash: [u8; 32] = hasher.finalize().into();
+        assert_eq!(owner_hash, entries.o_entry[..32]);
+
+        let mut hasher = Sha256::new();
+        hasher.update(truncate_password(b"owner-secret"));
+        hasher.update(&entries.o_entry[40..48]);
+        hasher.update(&entries.u_entry[..48]);
+        let owner_ik: [u8; 32] = hasher.finalize().into();
+        let unwrapped =
+            aes256_cbc_decrypt_raw(&owner_ik, &[0u8; 16], &entries.oe_entry).expect("OE decrypt");
+        assert_eq!(unwrapped.len(), 32);
+        assert_eq!(unwrapped, entries.file_key.to_vec());
+    }
+
+    #[test]
+    fn compute_r6_roundtrips_through_reader_verify() {
+        let entries = compute_entries_r6(b"user-secret", b"owner-secret", -4).expect("compute R6");
+
+        assert!(verify_user_password_r6(b"user-secret", &entries.u_entry));
+        let key = derive_file_key_r6(b"user-secret", &entries.u_entry, &entries.ue_entry)
+            .expect("derive R6 from computed entries");
+        assert_eq!(key, entries.file_key.to_vec());
+        // Wrong password must not verify.
+        assert!(!verify_user_password_r6(b"wrong", &entries.u_entry));
+    }
+
+    #[test]
+    fn perms_clear_block_layout() {
+        let block = perms_clear_block(-4);
+        assert_eq!(&block[..4], &(-4i32).to_le_bytes());
+        assert_eq!(&block[4..8], &[0xFF; 4]);
+        assert_eq!(&block[8..12], b"Tadb");
     }
 }

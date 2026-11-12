@@ -567,6 +567,18 @@ impl PdfDocument {
         Ok(obj)
     }
 
+    /// Return the generation number of an object from the xref table
+    /// (0 for free/unknown/compressed objects).
+    ///
+    /// Needed by the writer-side encryption to build per-object keys
+    /// (RC4 / AES-128 derive the key from obj-num + generation).
+    pub fn object_generation(&self, id: u32) -> u16 {
+        match self.xref.get(&id) {
+            Some(XRefEntry::InUse { generation, .. }) => *generation,
+            _ => 0u16,
+        }
+    }
+
     /// Follow indirect references recursively until a non-Reference is reached.
     ///
     /// Handles chains of the form `A → B → C → value`.

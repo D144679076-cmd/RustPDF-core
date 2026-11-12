@@ -22,6 +22,7 @@ use super::handlers;
         handlers::health,
         handlers::render,
         handlers::extract_text,
+        handlers::encrypt,
         handlers::search,
         handlers::merge,
         handlers::split,
@@ -64,6 +65,7 @@ pub fn build_router() -> axum::Router {
     axum::Router::new()
         .route("/api/v1/render", post(handlers::render))
         .route("/api/v1/extract-text", post(handlers::extract_text))
+        .route("/api/v1/encrypt", post(handlers::encrypt))
         .route("/api/v1/search", post(handlers::search))
         .route("/api/v1/merge", post(handlers::merge))
         .route("/api/v1/split", post(handlers::split))

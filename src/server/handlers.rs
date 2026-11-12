@@ -215,6 +215,118 @@ pub async fn extract_text(Query(params): Query<HashMap<String, String>>, body: B
     }
 }
 
+// ── POST /api/v1/encrypt ──────────────────────────────────────────────────────
+
+/// Encrypt a PDF with the standard security handler (full rewrite).
+///
+/// Query parameters:
+/// - `user_password` (optional, default empty — file opens without a prompt,
+///   permissions still enforced).
+/// - `owner_password` (optional, defaults to the user password).
+/// - `algorithm` (optional): `aes256` (default), `aes128`, `rc4`.
+/// - `allow` (optional): comma-separated permission list, default `all`.
+///   Use `none` or a subset of `print,modify,copy,annotate,fill_forms,
+///   extract_accessibility,assemble,print_high_quality`.
+///
+/// Returns the encrypted PDF bytes (`application/pdf`). Requires an
+/// Enterprise-tier license key.
+#[utoipa::path(
+    post,
+    path = "/api/v1/encrypt",
+    tag = "document",
+    params(
+        ("user_password" = Option<String>, Query, description = "User (open) password; empty = open without a prompt"),
+        ("owner_password" = Option<String>, Query, description = "Owner password; defaults to the user password"),
+        ("algorithm" = Option<String>, Query, description = "aes256 (default), aes128, or rc4"),
+        ("allow" = Option<String>, Query, description = "Comma-separated permission list (default all)"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/pdf", description = "PDF file bytes"),
+    responses(
+        (status = 200, description = "Encrypted PDF bytes", content_type = "application/pdf"),
+        (status = 422, description = "PDF processing error"),
+    )
+)]
+pub async fn encrypt(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
+    use crate::crypto::handler::Permissions;
+    use crate::writer::encrypt::{EncryptOptions, WriteAlgorithm};
+
+    let algorithm = match params.get("algorithm").map(|s| s.as_str()) {
+        None | Some("aes256") => WriteAlgorithm::Aes256R6,
+        Some("aes128") => WriteAlgorithm::Aes128,
+        Some("rc4") => WriteAlgorithm::Rc4_128,
+        Some(other) => {
+            return bad_request(&format!(
+                "invalid algorithm '{other}': expected aes256, aes128, or rc4"
+            ))
+        }
+    };
+
+    let mut permissions = Permissions {
+        can_print: true,
+        can_modify: true,
+        can_copy_text: true,
+        can_annotate: true,
+        can_fill_forms: true,
+        can_extract_accessibility: true,
+        can_assemble: true,
+        can_print_high_quality: true,
+    };
+    if let Some(allow) = params.get("allow") {
+        let list: Vec<String> = allow
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if list.len() == 1 && list[0] == "all" {
+            // keep all-allowed defaults
+        } else if list.len() == 1 && list[0] == "none" {
+            permissions = Permissions::default();
+        } else {
+            permissions = Permissions::default();
+            for flag in &list {
+                match flag.as_str() {
+                    "print" => permissions.can_print = true,
+                    "modify" => permissions.can_modify = true,
+                    "copy" => permissions.can_copy_text = true,
+                    "annotate" => permissions.can_annotate = true,
+                    "fill_forms" => permissions.can_fill_forms = true,
+                    "extract_accessibility" => permissions.can_extract_accessibility = true,
+                    "assemble" => permissions.can_assemble = true,
+                    "print_high_quality" => permissions.can_print_high_quality = true,
+                    other => {
+                        return bad_request(&format!(
+                            "invalid permission flag '{other}': expected print, modify, copy, \
+                             annotate, fill_forms, extract_accessibility, assemble, \
+                             print_high_quality, all, or none"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    let options = EncryptOptions {
+        user_password: params.get("user_password").cloned().unwrap_or_default(),
+        owner_password: params.get("owner_password").cloned(),
+        permissions,
+        algorithm,
+    };
+
+    let result: Result<Vec<u8>, String> = tokio::task::spawn_blocking(move || {
+        let mut editor =
+            crate::editor::PdfEditor::open(body.to_vec()).map_err(|e| e.to_string())?;
+        editor.set_encryption(options).map_err(|e| e.to_string())?;
+        editor.save_new().map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking panic: {e}")));
+
+    match result {
+        Ok(pdf) => pdf_response(pdf),
+        Err(e) => unprocessable(e),
+    }
+}
+
 // ── POST /api/v1/search ───────────────────────────────────────────────────────
 
 /// Search a PDF for occurrences of a query string.
@@ -1095,5 +1207,81 @@ mod tests {
             "unexpected status {}",
             resp.status()
         );
+    }
+
+    /// Valid Enterprise key for REST tests (validated offline by the license
+    /// module; test builds never need a real secret).
+    fn enterprise_key() -> String {
+        use crate::license::{encode_license_key, Tier};
+        encode_license_key(Tier::Enterprise, 0, "server-test")
+    }
+
+    fn minimal_pdf() -> Vec<u8> {
+        include_bytes!("../../tests/fixtures/minimal.pdf").to_vec()
+    }
+
+    #[tokio::test]
+    async fn encrypt_roundtrip_via_rest() {
+        let app = build_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/encrypt?user_password=restpw&algorithm=aes128")
+                    .header("X-API-Key", enterprise_key())
+                    .body(Body::from(minimal_pdf()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(content_type, "application/pdf");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        let doc = crate::parser::objects::PdfDocument::parse_with_password(bytes, b"restpw")
+            .expect("encrypted output parses with the password");
+        assert_eq!(doc.page_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn encrypt_invalid_algorithm_rejected() {
+        let app = build_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/encrypt?algorithm=rot13")
+                    .header("X-API-Key", enterprise_key())
+                    .body(Body::from(minimal_pdf()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn encrypt_invalid_permission_flag_rejected() {
+        let app = build_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/encrypt?allow=print,fly")
+                    .header("X-API-Key", enterprise_key())
+                    .body(Body::from(minimal_pdf()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

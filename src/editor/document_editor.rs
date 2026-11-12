@@ -48,6 +48,10 @@ pub struct PdfEditor {
     /// Redo history: snapshots pushed when [`PdfEditor::undo`] runs, cleared
     /// whenever a fresh [`PdfEditor::checkpoint`] is taken.
     redo_stack: Vec<crate::writer::document::PoolSnapshot>,
+    /// Pending encrypt-on-write settings (Phase P4). When set, the next
+    /// [`PdfEditor::save_new`] produces an encrypted full rewrite.
+    #[cfg(feature = "crypto")]
+    encryption: Option<crate::writer::encrypt::EncryptOptions>,
 }
 
 /// Maximum number of undo steps retained. Each step is a clone of the writer
@@ -122,6 +126,8 @@ impl PdfEditor {
             info_id,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            #[cfg(feature = "crypto")]
+            encryption: None,
         })
     }
 
@@ -368,7 +374,7 @@ impl PdfEditor {
             #[cfg(feature = "crypto")]
             let obj_ref: &PdfObject = if let Some(h) = &enc {
                 let mut o = obj.clone();
-                encrypt_object_for_write(&mut o, *id, *gen as u16, h)?;
+                encrypt_object_for_write(&mut o, *id, *gen as u16, h, true)?;
                 obj_owned = o;
                 &obj_owned
             } else {
@@ -448,7 +454,16 @@ impl PdfEditor {
     // plaintext file. The text-edit/save path uses save_append (which does
     // re-encrypt); redaction of encrypted docs is a separate follow-up.
     pub fn save_new(&mut self) -> Result<Vec<u8>> {
-        // Union of original xref IDs and any new/modified objects from the writer.
+        // ── Pass 1: build the fresh pool ──────────────────────────────────────
+        // Doc-sourced objects may carry still-encrypted stream bodies (string
+        // values are decrypted at get_object time, bodies at get_stream_data
+        // time). With `crypto`, decrypt those bodies here so the pool is fully
+        // plaintext; editor-pool objects are plaintext already.
+        let writer_ids: std::collections::HashSet<u32> =
+            self.writer.all_ids().into_iter().collect();
+        #[cfg(feature = "crypto")]
+        let source_handler = self.doc.encryption_handler().cloned();
+
         let mut all_ids: Vec<u32> = self.doc.all_object_ids();
         for id in self.writer.all_ids() {
             if !all_ids.contains(&id) {
@@ -457,20 +472,160 @@ impl PdfEditor {
         }
         all_ids.sort();
 
-        // Build a fresh writer containing the complete logical document (CoW:
-        // writer overrides win over original doc objects).
         let mut fresh = crate::writer::document::PdfWriter::new();
-        for id in all_ids {
-            match self.get_object(id) {
-                Ok(obj) => {
-                    fresh.set_object(id, obj);
+        for id in &all_ids {
+            if writer_ids.contains(id) {
+                // Writer override (CoW replacement or new object) — plaintext.
+                match self.writer.get_object(*id) {
+                    Some(obj) => fresh.set_object(*id, obj.clone()),
+                    None => continue,
                 }
-                Err(e) => {
-                    log::warn!("save_new: skipping unreadable object {}: {}", id, e);
+            } else {
+                match self.doc.get_object(*id) {
+                    #[cfg(feature = "crypto")]
+                    Ok(mut obj) => {
+                        if let Some(src) = &source_handler {
+                            let gen = self.doc.object_generation(*id);
+                            if let PdfObject::Stream(st) = &mut obj {
+                                st.raw_data = src.decrypt_stream(*id, gen, &st.raw_data)?;
+                            }
+                        }
+                        fresh.set_object(*id, obj);
+                    }
+                    #[cfg(not(feature = "crypto"))]
+                    Ok(obj) => fresh.set_object(*id, obj),
+                    Err(e) => {
+                        log::warn!("save_new: skipping unreadable object {}: {}", id, e);
+                    }
                 }
             }
         }
-        fresh.serialize_all(self.catalog_id, self.info_id, None)
+
+        // ── Pass 2: encryption (Phase P4) ─────────────────────────────────────
+        // Three cases, in priority order:
+        // 1. `set_encryption` was called → fresh encryption with the given
+        //    options (replaces any source-document encryption).
+        // 2. Source document was encrypted but no new options were set →
+        //    re-encrypt with the source handler so a full rewrite keeps the
+        //    original content protected (previously produced a
+        //    structurally-encrypted-but-plaintext file — see TODO history).
+        // 3. Neither → plain output.
+        //
+        // Encryption REQUIRES a full rewrite: incremental append cannot
+        // retroactively encrypt the original plaintext bytes.
+        #[cfg(feature = "crypto")]
+        let mut trailer_encrypt: Option<(u32, [u8; 16])> = None;
+        #[cfg(feature = "crypto")]
+        {
+            let fresh_options = self.encryption.clone();
+            let source_handler = if fresh_options.is_some() {
+                None
+            } else {
+                source_handler
+            };
+
+            if let Some(options) = fresh_options {
+                crate::license::require(crate::license::Tier::Enterprise, "encryption")?;
+                // ISO 32000-2 removed RC4 — the writer already enforces this
+                // for /Encrypt dicts in the pool under V2_0; reject early with
+                // a clear message.
+                if fresh.emit_version() == crate::writer::document::EmitVersion::V2_0
+                    && options.algorithm == crate::writer::encrypt::WriteAlgorithm::Rc4_128
+                {
+                    return Err(PdfError::write_error(
+                        "PDF 2.0 output cannot use RC4 encryption (ISO 32000-2 removed it); \
+                         use aes128 or aes256",
+                    ));
+                }
+                let built = crate::writer::encrypt::build_encryption(&options)?;
+                // Pool is fully plaintext after pass 1 — encrypt everything
+                // (bodies included) at gen 0 (the pool's written generation).
+                for id in fresh.all_ids() {
+                    if let Some(mut obj) = fresh.get_object(id).cloned() {
+                        crate::writer::encrypt::encrypt_object_for_write(
+                            &mut obj,
+                            id,
+                            0,
+                            &built.handler,
+                            true,
+                        )?;
+                        fresh.set_object(id, obj);
+                    }
+                }
+                let enc_id = fresh.reserve_id();
+                fresh.set_object(enc_id, PdfObject::Dictionary(built.dict));
+                trailer_encrypt = Some((enc_id, built.file_id));
+            } else if let Some(handler) = source_handler {
+                // Re-encrypt a previously-encrypted document with its original
+                // handler: same file key, same /Encrypt dict, same /ID. Pass 1
+                // already decrypted everything into the pool, so this is a
+                // uniform re-encryption at the pool's written generation (0) —
+                // per-object keys (RC4/AES-128) must match what a reader will
+                // derive from the NEW xref, not the original one.
+                let enc_dict = self.doc.trailer.get("Encrypt").cloned();
+                for id in fresh.all_ids() {
+                    if let Some(mut obj) = fresh.get_object(id).cloned() {
+                        crate::writer::encrypt::encrypt_object_for_write(
+                            &mut obj, id, 0, &handler, true,
+                        )?;
+                        fresh.set_object(id, obj);
+                    }
+                }
+                if let Some(dict) = enc_dict {
+                    let enc_id = fresh.reserve_id();
+                    fresh.set_object(enc_id, dict);
+                    trailer_encrypt = Some((enc_id, source_file_id(&self.doc.trailer)));
+                }
+            }
+        }
+
+        match trailer_encrypt {
+            #[cfg(feature = "crypto")]
+            Some((enc_id, file_id)) => {
+                fresh.serialize_all_encrypted(self.catalog_id, self.info_id, enc_id, &file_id)
+            }
+            _ => fresh.serialize_all(self.catalog_id, self.info_id, None),
+        }
+    }
+
+    /// Enable encrypt-on-write for the next [`save_new`](Self::save_new).
+    ///
+    /// Requires an `Enterprise` license. The encryption is applied to a
+    /// **full rewrite** — incremental append cannot retroactively encrypt
+    /// plaintext bytes, so [`save_append`](Self::save_append) ignores these
+    /// settings for unencrypted documents (for already-encrypted documents it
+    /// keeps the original file key, as before).
+    ///
+    /// Calling again replaces the pending options; pass `None` to disable
+    /// (note: a source document that was already encrypted keeps its
+    /// encryption on `save_new` regardless — see the module docs).
+    #[cfg(feature = "crypto")]
+    pub fn set_encryption(
+        &mut self,
+        options: impl Into<Option<crate::writer::encrypt::EncryptOptions>>,
+    ) -> Result<()> {
+        match options.into() {
+            Some(options) => {
+                crate::license::require(crate::license::Tier::Enterprise, "encryption")?;
+                if self.writer.emit_version() == crate::writer::document::EmitVersion::V2_0
+                    && options.algorithm == crate::writer::encrypt::WriteAlgorithm::Rc4_128
+                {
+                    return Err(PdfError::write_error(
+                        "PDF 2.0 output cannot use RC4 encryption (ISO 32000-2 removed it); \
+                         use aes128 or aes256",
+                    ));
+                }
+                self.encryption = Some(options);
+            }
+            None => self.encryption = None,
+        }
+        Ok(())
+    }
+
+    /// Whether encrypt-on-write is pending for the next full rewrite.
+    #[cfg(feature = "crypto")]
+    pub fn encryption_pending(&self) -> bool {
+        self.encryption.is_some()
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -488,6 +643,23 @@ impl PdfEditor {
     }
 }
 
+/// Extract the first element of the trailer `/ID` array as a 16-byte value.
+///
+/// Encrypted rewrites must keep the original `/ID` so readers re-derive the
+/// same file key. Missing/short `/ID` falls back to zeros (non-conformant
+/// source, still readable).
+#[cfg(feature = "crypto")]
+fn source_file_id(trailer: &PdfDict) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    if let Some(PdfObject::Array(items)) = trailer.get("ID") {
+        if let Some(PdfObject::String(first)) = items.first() {
+            let n = first.len().min(16);
+            id[..n].copy_from_slice(&first[..n]);
+        }
+    }
+    id
+}
+
 /// Recursively encrypt every string and stream body inside a newly-written
 /// object, in place, using the document's encryption handler.
 ///
@@ -496,36 +668,18 @@ impl PdfEditor {
 /// booleans, nulls and references are left untouched. The caller must NOT pass
 /// the `/Encrypt` dictionary or the trailer `/ID` here — those are exempt from
 /// encryption (ISO 32000-1 §7.6.1).
+///
+/// Moved to [`crate::writer::encrypt::encrypt_object_for_write`] (Phase P4);
+/// `save_append` now uses that implementation directly.
 #[cfg(feature = "crypto")]
 fn encrypt_object_for_write(
     obj: &mut PdfObject,
     id: u32,
     gen: u16,
     h: &crate::crypto::EncryptionHandler,
+    encrypt_stream_bodies: bool,
 ) -> Result<()> {
-    match obj {
-        PdfObject::String(s) => h.encrypt_string(id, gen, s)?,
-        PdfObject::Array(items) => {
-            for it in items.iter_mut() {
-                encrypt_object_for_write(it, id, gen, h)?;
-            }
-        }
-        PdfObject::Dictionary(d) => {
-            for v in d.values_mut() {
-                encrypt_object_for_write(v, id, gen, h)?;
-            }
-        }
-        PdfObject::Stream(st) => {
-            for v in st.dict.values_mut() {
-                encrypt_object_for_write(v, id, gen, h)?;
-            }
-            // Encrypt the (already filter-applied) stream body; the serializer
-            // recomputes /Length from raw_data, so the encrypted length is correct.
-            st.raw_data = h.encrypt_stream(id, gen, &st.raw_data)?;
-        }
-        _ => {}
-    }
-    Ok(())
+    crate::writer::encrypt::encrypt_object_for_write(obj, id, gen, h, encrypt_stream_bodies)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

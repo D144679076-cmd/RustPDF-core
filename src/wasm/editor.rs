@@ -1301,6 +1301,14 @@ impl WasmEditor {
     /// methods work on the new bytes.
     pub fn save(&mut self) -> Result<js_sys::Uint8Array, JsError> {
         log::debug!("[pdf-core] WasmEditor::save — serialising incremental update");
+        // Encrypt-on-write is pending: `save_append` cannot retroactively
+        // encrypt plaintext bytes — the host must call `save_encrypted`.
+        #[cfg(feature = "crypto")]
+        if self.editor.encryption_pending() {
+            log::warn!(
+                "[save] encrypt-on-write is PENDING but ignored by incremental save — call save_encrypted() for a full encrypted rewrite"
+            );
+        }
         // Diagnostic: if a text-edit session has dirty (patched-but-not-flushed)
         // streams, those edits live only in the in-memory model — `save_append`
         // serialises the WRITER POOL, which does NOT contain them yet. So this save
@@ -1951,6 +1959,152 @@ impl WasmPdfWriter {
 }
 
 // ---------------------------------------------------------------------------
+// Encrypt on write (Phase P4) — requires the `crypto` feature
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen]
+impl WasmEditor {
+    /// Enable encrypt-on-write for the next full-rewrite save.
+    ///
+    /// `options_json` is a JSON object:
+    /// - `user_password` (string, default `""` — opens without a prompt)
+    /// - `owner_password` (string, optional — defaults to the user password)
+    /// - `algorithm` (string: `"aes256"` (default), `"aes128"`, or `"rc4"`;
+    ///   note RC4 is forbidden in PDF 2.0 output)
+    /// - `permissions` (object of booleans, all default `true`): `print`,
+    ///   `modify`, `copy`, `annotate`, `fill_forms`, `extract_accessibility`,
+    ///   `assemble`, `print_high_quality`
+    ///
+    /// Requires an Enterprise license. The encryption applies on a FULL
+    /// rewrite — call [`save_encrypted`](Self::save_encrypted) (incremental
+    /// `save` cannot retroactively encrypt plaintext bytes).
+    #[cfg(feature = "crypto")]
+    pub fn set_encryption(&mut self, options_json: &str) -> Result<(), JsError> {
+        let options = parse_encryption_options(options_json)?;
+        self.editor
+            .set_encryption(options)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Disable pending encrypt-on-write settings.
+    #[cfg(feature = "crypto")]
+    pub fn clear_encryption(&mut self) {
+        let _ = self.editor.set_encryption(None);
+    }
+
+    /// Whether encrypt-on-write is pending for the next full rewrite.
+    #[cfg(feature = "crypto")]
+    pub fn encryption_pending(&self) -> bool {
+        self.editor.encryption_pending()
+    }
+
+    /// Serialise the document as a **full rewrite**, applying any pending
+    /// encrypt-on-write settings (or, for an already-encrypted document with
+    /// none pending, preserving its encryption).
+    ///
+    /// Unlike [`save`](Self::save) this is not an incremental update: the
+    /// complete document is re-serialised (and re-encrypted, when encryption
+    /// is active). Returned bytes become the new baseline for subsequent
+    /// incremental saves.
+    #[cfg(feature = "crypto")]
+    pub fn save_encrypted(&mut self) -> Result<js_sys::Uint8Array, JsError> {
+        let new_bytes = self
+            .editor
+            .save_new()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        self.original_bytes = new_bytes.clone();
+        Ok(js_sys::Uint8Array::from(new_bytes.as_slice()))
+    }
+}
+
+/// Parse [`crate::writer::encrypt::EncryptOptions`] from a JSON object string,
+/// applying defaults for missing fields (empty user password, all
+/// permissions allowed, AES-256 R6).
+#[cfg(feature = "crypto")]
+fn parse_encryption_options(
+    json: &str,
+) -> crate::error::Result<crate::writer::encrypt::EncryptOptions> {
+    use crate::writer::encrypt::{EncryptOptions, WriteAlgorithm};
+
+    let mut opts = EncryptOptions::default();
+    if let Some(pw) = json_str_field(json, "user_password")? {
+        opts.user_password = pw;
+    }
+    if let Some(pw) = json_str_field(json, "owner_password")? {
+        opts.owner_password = Some(pw);
+    }
+    if let Some(alg) = json_str_field(json, "algorithm")? {
+        opts.algorithm = WriteAlgorithm::from_name(&alg).ok_or_else(|| {
+            crate::error::PdfError::invalid_structure(&format!(
+                "unknown algorithm '{alg}': expected aes256, aes128, or rc4"
+            ))
+        })?;
+    }
+    if let Some(perms_json) = json_object_field(json, "permissions")? {
+        if let Some(v) = json_bool_field(&perms_json, "print")? {
+            opts.permissions.can_print = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "modify")? {
+            opts.permissions.can_modify = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "copy")? {
+            opts.permissions.can_copy_text = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "annotate")? {
+            opts.permissions.can_annotate = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "fill_forms")? {
+            opts.permissions.can_fill_forms = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "extract_accessibility")? {
+            opts.permissions.can_extract_accessibility = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "assemble")? {
+            opts.permissions.can_assemble = v;
+        }
+        if let Some(v) = json_bool_field(&perms_json, "print_high_quality")? {
+            opts.permissions.can_print_high_quality = v;
+        }
+    }
+    Ok(opts)
+}
+
+/// Extract an optional nested JSON object field (value between the balanced
+/// braces following the key) as a string for further flat-field parsing.
+#[cfg(feature = "crypto")]
+fn json_object_field(obj: &str, key: &str) -> crate::error::Result<Option<String>> {
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = obj.find(&needle) else {
+        return Ok(None);
+    };
+    let rest = obj[pos + needle.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| crate::error::PdfError::invalid_structure("expected ':' after JSON key"))?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('{') {
+        return Ok(None);
+    }
+    let mut depth = 0usize;
+    let bytes = rest.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(Some(rest[..=i].to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(crate::error::PdfError::invalid_structure(
+        "unbalanced braces in JSON object field",
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Native-accessible byte-returning variants (for Rust tests and non-JS use)
 // ---------------------------------------------------------------------------
 
@@ -1958,6 +2112,15 @@ impl WasmEditor {
     /// Like [`save`](WasmEditor::save) but returns raw `Vec<u8>` bytes.
     pub fn save_bytes(&mut self) -> crate::error::Result<Vec<u8>> {
         let bytes = self.editor.save_append(&self.original_bytes)?;
+        self.original_bytes = bytes.clone();
+        Ok(bytes)
+    }
+
+    /// Like [`save_encrypted`](WasmEditor::save_encrypted) but returns raw
+    /// `Vec<u8>` bytes (native/tests).
+    #[cfg(feature = "crypto")]
+    pub fn save_encrypted_bytes(&mut self) -> crate::error::Result<Vec<u8>> {
+        let bytes = self.editor.save_new()?;
         self.original_bytes = bytes.clone();
         Ok(bytes)
     }

@@ -281,6 +281,40 @@ impl PdfWriter {
         info_id: Option<u32>,
         prev_xref_offset: Option<u64>,
     ) -> Result<Vec<u8>> {
+        self.serialize_all_impl(root_id, info_id, prev_xref_offset, None, None)
+    }
+
+    /// Serialize a fully rewritten *encrypted* document.
+    ///
+    /// Same as [`serialize_all`] but the trailer gains `/Encrypt` (pointing
+    /// at `encrypt_ref`, an already-pooled `/Encrypt` dictionary object) and
+    /// `/ID` (`file_id`, required for key derivation). The pool must already
+    /// be encrypted — see [`crate::writer::encrypt`]. `/ID` must also match
+    /// what was used to build the `/Encrypt` entries.
+    pub fn serialize_all_encrypted(
+        &mut self,
+        root_id: u32,
+        info_id: Option<u32>,
+        encrypt_ref: u32,
+        file_id: &[u8; 16],
+    ) -> Result<Vec<u8>> {
+        self.serialize_all_impl(
+            root_id,
+            info_id,
+            None,
+            Some(encrypt_ref),
+            Some(file_id.to_vec()),
+        )
+    }
+
+    fn serialize_all_impl(
+        &mut self,
+        root_id: u32,
+        info_id: Option<u32>,
+        prev_xref_offset: Option<u64>,
+        encrypt_ref: Option<u32>,
+        file_id: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
         // PDF 2.0 emission policy pre-pass (Phase E, plan doc §Phase E):
         // header choice + catalog /Version + /UF autofill + RC4 reject all
         // happen here so the *whole* document is consistent, not just the
@@ -318,7 +352,16 @@ impl PdfWriter {
         let size = max_id + 1;
 
         let xref_start = out.len() as u64;
-        let trailer = build_trailer_dict(size, root_id, info_id, prev_xref_offset);
+        let mut trailer = build_trailer_dict(size, root_id, info_id, prev_xref_offset);
+        if let Some(enc_id) = encrypt_ref {
+            trailer.insert("Encrypt".to_owned(), PdfObject::Reference(enc_id, 0));
+        }
+        if let Some(id) = file_id {
+            trailer.insert(
+                "ID".to_owned(),
+                PdfObject::Array(vec![PdfObject::String(id.clone()), PdfObject::String(id)]),
+            );
+        }
         write_full_xref_and_trailer(&offsets, &trailer, xref_start, &mut out);
 
         Ok(out)

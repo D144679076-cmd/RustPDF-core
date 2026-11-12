@@ -9,7 +9,8 @@
 
 #[cfg(feature = "wasm-core")]
 mod wasm_tests {
-    use pdf_core::wasm::{WasmDocument, WasmEditor, WasmPdfWriter};
+    use pdf_core::wasm::document::WasmDocument;
+    use pdf_core::wasm::editor::{WasmEditor, WasmPdfWriter};
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -111,6 +112,7 @@ mod wasm_tests {
 
     #[test]
     fn wasm_editor_add_text_annotation_and_save() {
+        ensure_enterprise_license(); // add_annotation is Pro-gated
         let bytes = fixture("minimal.pdf");
         let mut editor = WasmEditor::open(&bytes).unwrap();
         editor
@@ -123,6 +125,7 @@ mod wasm_tests {
 
     #[test]
     fn wasm_editor_add_highlight_and_save() {
+        ensure_enterprise_license(); // add_annotation is Pro-gated
         let bytes = fixture("minimal.pdf");
         let mut editor = WasmEditor::open(&bytes).unwrap();
         let quad_points = [100.0f64, 700.0, 300.0, 700.0, 100.0, 715.0, 300.0, 715.0];
@@ -159,6 +162,7 @@ mod wasm_tests {
 
     #[test]
     fn wasm_editor_add_link_annotation() {
+        ensure_enterprise_license(); // add_annotation is Pro-gated
         let bytes = fixture("minimal.pdf");
         let mut editor = WasmEditor::open(&bytes).unwrap();
         editor
@@ -200,4 +204,57 @@ mod wasm_tests {
         let doc = pdf_core::PdfDocument::parse(bytes).unwrap();
         assert_eq!(doc.page_count().unwrap(), 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Encrypt on write (Phase P4)
+    // -----------------------------------------------------------------------
+
+    /// Activate an Enterprise license once for the process so the gated
+    /// encryption path passes. Idempotent.
+    fn ensure_enterprise_license() {
+        use pdf_core::license::{activate, encode_license_key, validate_license_key, Tier};
+        let key = encode_license_key(Tier::Enterprise, 0, "integration-test");
+        let _ = activate(validate_license_key(&key).expect("test key must be valid"));
+    }
+
+    #[test]
+    fn wasm_editor_set_encryption_and_save_encrypted() {
+        ensure_enterprise_license();
+        let bytes = fixture("minimal.pdf");
+        let mut editor = WasmEditor::open(&bytes).unwrap();
+        assert!(!editor.encryption_pending());
+        editor
+            .set_encryption(r#"{"user_password": "wasm-pw", "algorithm": "aes128"}"#)
+            .expect("set_encryption should succeed");
+        assert!(editor.encryption_pending());
+
+        let saved = editor.save_encrypted_bytes().expect("save_encrypted_bytes");
+        assert!(editor.encryption_pending()); // settings persist for future saves
+
+        let doc = pdf_core::PdfDocument::parse_with_password(saved, b"wasm-pw")
+            .expect("output parses with the password");
+        assert_eq!(doc.page_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn wasm_editor_clear_encryption() {
+        ensure_enterprise_license();
+        let bytes = fixture("minimal.pdf");
+        let mut editor = WasmEditor::open(&bytes).unwrap();
+        editor
+            .set_encryption(r#"{"user_password": "x"}"#)
+            .expect("set_encryption");
+        assert!(editor.encryption_pending());
+        editor.clear_encryption();
+        assert!(!editor.encryption_pending());
+        // Plain save works again.
+        let saved = editor.save_bytes().unwrap();
+        pdf_core::PdfDocument::parse(saved).expect("plain re-parse");
+    }
+
+    // NOTE: the invalid-options Err path is not testable on the native rlib
+    // target — converting a wasm_bindgen Result's JsError to a JS exception
+    // calls JS intrinsics that panic on non-wasm targets ("cannot call
+    // wasm-bindgen imported functions on non-wasm targets"). The parse-level
+    // rejection is covered by the unit test on WriteAlgorithm::from_name.
 }

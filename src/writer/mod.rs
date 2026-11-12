@@ -4,6 +4,8 @@
 
 pub mod content_builder;
 pub mod document;
+#[cfg(feature = "crypto")]
+pub mod encrypt;
 pub mod font;
 pub mod font_subset;
 pub mod image;
