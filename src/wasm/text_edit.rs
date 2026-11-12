@@ -2492,7 +2492,7 @@ mod tests {
     /// After a FAST-PATH re-entry (same page/gen), `active_text_edit` must NOT be
     /// cleared — clearing it races with fire-and-forget commits on the JS side.
     #[test]
-    #[cfg(feature = "wasm")]
+    #[cfg(feature = "wasm-core")]
     fn text_edit_enter_fast_path_preserves_active_session() {
         use crate::wasm::editor::WasmEditor;
         use std::path::PathBuf;
@@ -2533,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "wasm")]
+    #[cfg(feature = "wasm-core")]
     fn commit_italic_underline_keeps_original_font_and_commits() {
         use crate::wasm::editor::WasmEditor;
         use std::path::PathBuf;

@@ -1,6 +1,6 @@
 //! WASM bridge — `#[wasm_bindgen]` wrappers for JavaScript integration.
 //!
-//! Enabled by the `wasm` Cargo feature.  `wasm-pack build --features wasm`
+//! Enabled by the `wasm-core` Cargo feature.  `wasm-pack build --features wasm`
 //! produces the `pkg/` directory with `pdf_core.js` and `pdf_core_bg.wasm`.
 //!
 //! Enable `wasm-render` instead to also include page rendering.
@@ -8,10 +8,10 @@
 
 pub mod document;
 // Editor and writer bindings require the full wasm feature (writer + forms + crypto).
-#[cfg(any(feature = "wasm", feature = "wasm-render"))]
+#[cfg(feature = "wasm-core")]
 pub mod editor;
 pub mod streaming;
-#[cfg(any(feature = "wasm", feature = "wasm-render"))]
+#[cfg(feature = "wasm-core")]
 pub mod text_edit;
 
 use wasm_bindgen::prelude::*;

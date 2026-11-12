@@ -7,7 +7,7 @@
 //!
 //! Enable with `--features wasm`.
 
-#[cfg(feature = "wasm")]
+#[cfg(feature = "wasm-core")]
 mod wasm_tests {
     use pdf_core::wasm::{WasmDocument, WasmEditor, WasmPdfWriter};
     use std::path::PathBuf;

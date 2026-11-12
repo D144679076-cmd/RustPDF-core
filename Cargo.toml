@@ -75,10 +75,20 @@ ffi = ["search"]
 # Mobile SDK — C FFI + uniffi-generated Swift/Kotlin bindings (Phase 4b/4c).
 # Enterprise tier. Native only.
 mobile = ["ffi", "dep:uniffi", "search"]
-# WASM bridge: exposes #[wasm_bindgen] types for JS integration.
-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto", "js-actions", "search"]
+# WASM bridge payload: the cfg-gated #[wasm_bindgen] module (writer + forms +
+# crypto + search). Never enable alone — pick `wasm`, `wasm-no-js` or
+# `wasm-render-no-js` on top.
+wasm-core = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "writer", "forms", "crypto", "search"]
+# Full WASM bridge (incl. the JS engine — QuickJS C layer needs a C sysroot
+# such as wasi-sdk when building for wasm32-unknown-unknown).
+wasm = ["wasm-core", "js-actions"]
 # WASM bridge with page rendering included (adds ~800 KB to the WASM binary).
 wasm-render = ["wasm", "render"]
+# WASM bridge WITHOUT the JS-actions engine: excludes the QuickJS C layer so it
+# links on wasm32-unknown-unknown (which has no C libc) and is ~1 MB smaller.
+# Used by the web editor, which does not expose the JS engine API.
+wasm-no-js = ["wasm-core"]
+wasm-render-no-js = ["wasm-no-js", "render"]
 # Viewer-only WASM build: parse, render, text extract. No editor, writer, forms, or crypto.
 wasm-viewer = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_log", "dep:console_error_panic_hook", "render"]
 # REST API server — Enterprise tier, native only.

@@ -1,4 +1,4 @@
-.PHONY: wasm wasm-no-render wasm-viewer wasm-sdk check-size
+.PHONY: wasm wasm-no-render wasm-render-no-js wasm-viewer wasm-sdk wasm-sdk-no-js check-size
 
 WASM_PACK := $(shell which wasm-pack 2>/dev/null || echo ~/.cargo/bin/wasm-pack)
 
@@ -7,6 +7,12 @@ WASM_PACK := $(shell which wasm-pack 2>/dev/null || echo ~/.cargo/bin/wasm-pack)
 wasm:
 	$(WASM_PACK) build --target web -d ../web-editor/src/pkg \
 	  -- --features wasm-render --no-default-features
+
+# Web-editor build WITHOUT the JS-actions engine (no QuickJS C layer) —
+# links on wasm32-unknown-unknown and is ~1 MB smaller. Preferred for e2e.
+wasm-render-no-js:
+	$(WASM_PACK) build --target web -d ../web-editor/src/pkg \
+	  -- --features wasm-render-no-js --no-default-features
 
 wasm-no-render:
 	$(WASM_PACK) build --target web -d ../web-editor/src/pkg \
@@ -27,6 +33,12 @@ wasm-sdk:
 	  --out-dir ../packages/sdk/pkg \
 	  --out-name pdf_core \
 	  -- --features wasm-render --no-default-features
+
+# SDK type/build dependency (no JS engine, links on wasm32-unknown-unknown)
+# → pdf-editor-rust-core/pkg/ (referenced by packages/sdk via file:).
+wasm-sdk-no-js:
+	$(WASM_PACK) build --target web -d pkg \
+	  -- --features wasm-render-no-js --no-default-features
 
 # ── Size verification ─────────────────────────────────────────────────────────
 # Brotli targets: viewer < 500 KB compressed, sdk < 1.2 MB compressed.

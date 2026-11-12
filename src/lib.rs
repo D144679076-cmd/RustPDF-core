@@ -39,7 +39,7 @@ pub mod server;
 pub mod signatures;
 pub mod streaming;
 pub mod text;
-#[cfg(feature = "wasm")]
+#[cfg(feature = "wasm-core")]
 pub mod wasm;
 #[cfg(feature = "writer")]
 pub mod writer;
